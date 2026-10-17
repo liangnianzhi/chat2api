@@ -11,24 +11,23 @@
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
  *   GET  /__preload.js   -> the browser bridge + upstream's preload bundle
  *   /management/*        -> rewritten to /v0/management/*, then to the proxy
- *   everything else      -> upstream's Koa app (the OpenAI-compatible API)
+ *   everything else      -> upstream's HTTP handler (the OpenAI-compatible API)
  *
  * NO SECOND PORT
  * --------------
- * Upstream's ProxyServer wants its own listen port. Rather than run a second
- * server on loopback and forward to it, the shim intercepts that listen() call
- * and publishes the Koa app's callback() as __koaHandler. This module feeds
- * requests straight into that handler, so the container really does have one
- * server on one port, with no extra HTTP hop.
+ * Upstream's ProxyServer wants its own listen port. The shim intercepts that
+ * bind (at http.Server.prototype.listen, see electron-shim.js) and publishes the
+ * replayed request handler as __httpHandler. This module feeds requests straight
+ * into it, so the container has one server on one port with no extra HTTP hop.
  *
- * The loopback path is kept as a fallback: if the handler cannot be obtained
- * (upstream restructures, or the capture did not happen), requests are proxied
- * to the gateway's own port instead, so the API degrades rather than breaking.
+ * The loopback path stays as a fallback: if the handler is missing (capture did
+ * not happen, or upstream restructured), requests are proxied to the gateway's
+ * own port so the API degrades rather than breaking.
  *
  * MANAGEMENT AUTH
  * ---------------
  * Upstream's management middleware expects a secret. Requests are handed to the
- * Koa app directly here, so this server sets the Authorization header for
+ * proxy directly here, so this server sets the Authorization header for
  * management paths before the hand-off. Direct API clients are unaffected:
  * /v1 passes through untouched.
  */
@@ -48,7 +47,7 @@ const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'pr
 // The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
-// Fallback only: used if the in-process Koa handler is unavailable.
+// Fallback only: used if the in-process handler is unavailable.
 const GATEWAY = {
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
@@ -78,17 +77,17 @@ function bridgeReady() {
 }
 
 /**
- * The captured upstream Koa request handler, or null before the proxy starts.
+ * The captured upstream request handler, or null before the proxy binds.
  *
- * Resolved per request rather than cached here: the shim owns the captured
- * handler and may publish it after this server has begun listening.
+ * Resolved per request rather than cached: the shim owns the captured handler and
+ * may publish it after this server has begun listening.
  */
 function proxyHandler() {
-  if (!shim || typeof shim.__koaHandler !== 'function') return null
+  if (!shim || typeof shim.__httpHandler !== 'function') return null
   try {
-    return shim.__koaHandler() || null
+    return shim.__httpHandler() || null
   } catch (err) {
-    console.warn('[front] could not read the Koa handler:', err.message)
+    console.warn('[front] could not read the captured handler:', err.message)
     return null
   }
 }
@@ -369,10 +368,10 @@ function proxyToGateway(req, res) {
 }
 
 /**
- * Hand the request to upstream's Koa app in-process.
+ * Hand the request to upstream's handler in-process.
  *
  * Falls back to the loopback proxy when the handler is not available, which
- * covers the moment before the proxy starts and any surprise about its shape.
+ * covers the moment before the proxy binds and any surprise about its shape.
  * Either way the response is upstream's own.
  */
 function dispatch(req, res, urlPath) {

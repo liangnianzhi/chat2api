@@ -1,19 +1,18 @@
 /**
  * Container supervisor.
  *
- * Runs the Chat2API gateway and, when enabled, the web management console
- * alongside it. Both are plain Node processes.
+ * Runs the Chat2API gateway and the single front server that exposes it.
  *
  * WHY A SUPERVISOR RATHER THAN TWO CONTAINERS
  * -------------------------------------------
- * The console is a thin reverse proxy in front of the gateway's management
- * API. Co-locating them keeps deployment to a single container and lets the
- * console reach the gateway over loopback, so the management API itself never
- * has to be published.
+ * The front server owns the one public port: it serves the console at / and
+ * proxies everything else to the gateway, which listens on loopback only. That
+ * gives the container a single address for both the UI and the API, matching how
+ * the desktop app presented them.
  *
  * Design notes:
  *   * The gateway is the primary process: if it exits, the container exits.
- *   * The console is best-effort: if it fails to start, the gateway keeps
+ *   * The front server is best-effort: if it fails to start, the gateway keeps
  *     serving API traffic and the failure is logged loudly.
  *   * Both are terminated together on SIGTERM so upstream's log flush runs.
  */
@@ -35,16 +34,16 @@ const GATEWAY_ENTRY = process.env.CHAT2API_BUNDLE
   || path.join(APP_DIR, 'upstream', 'main', 'headless.js')
 const SHIM_PATH = process.env.CHAT2API_SHIM
   || path.join(APP_DIR, 'shim', 'electron-shim.js')
-const UI_ENTRY = path.join(APP_DIR, 'webui', 'server.js')
+const FRONT_ENTRY = path.join(APP_DIR, 'webui', 'server.js')
 
-const ENABLE_UI = envBool('CHAT2API_ENABLE_WEBUI', true)
+const ENABLE_FRONT = envBool('CHAT2API_ENABLE_WEBUI', true)
 
 const children = []
 let shuttingDown = false
 
-function start(name, args, extraEnv) {
+function start(name, args) {
   const child = spawn(process.execPath, args, {
-    env: { ...process.env, ...(extraEnv || {}) },
+    env: process.env,
     stdio: 'inherit',
   })
   child.on('exit', (code, signal) => {
@@ -103,27 +102,26 @@ console.log('[gateway] electron shim active')
 require(GATEWAY_ENTRY)
 
 /* ------------------------------------------------------------------ */
-/* Web console                                                         */
+/* Front server                                                        */
 /* ------------------------------------------------------------------ */
-if (ENABLE_UI) {
-  if (fs.existsSync(UI_ENTRY)) {
-    // CHAT2API_UI_PORT must never collide with the gateway's own port.
-    const gatewayPort = process.env.CHAT2API_PORT || '8080'
-    const uiPort = process.env.CHAT2API_UI_PORT || '8081'
-    if (uiPort === gatewayPort) {
-      console.error('[supervisor] CHAT2API_UI_PORT equals CHAT2API_PORT - '
-        + 'the console would shadow the API. Set it to a different port.')
+if (ENABLE_FRONT) {
+  if (fs.existsSync(FRONT_ENTRY)) {
+    const publicPort = process.env.CHAT2API_PORT || '8080'
+    const internalPort = process.env.CHAT2API_INTERNAL_PORT || '18080'
+    if (publicPort === internalPort) {
+      console.error('[supervisor] CHAT2API_PORT equals CHAT2API_INTERNAL_PORT - '
+        + 'the front server and the gateway would fight for the same port.')
     } else {
       setTimeout(() => {
-        if (!shuttingDown) start('webui', [UI_ENTRY])
+        if (!shuttingDown) start('front', [FRONT_ENTRY])
       }, 1500) // let the gateway bind first so the proxy has a target
     }
   } else {
-    console.error('[supervisor] web console entry not found at', UI_ENTRY,
-      '- continuing without it')
+    console.error('[supervisor] front server entry not found at', FRONT_ENTRY,
+      '- continuing without a UI')
   }
 } else {
-  console.log('[supervisor] web console disabled (CHAT2API_ENABLE_WEBUI=false)')
+  console.log('[supervisor] front server disabled (CHAT2API_ENABLE_WEBUI=false)')
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM', 0))

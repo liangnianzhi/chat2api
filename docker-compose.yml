@@ -4,14 +4,15 @@
 #
 #   1. mkdir -p data
 #   2. docker compose up -d
-#   3. 浏览器打开 http://<主机IP>:8081
+#   3. 浏览器打开 http://<主机IP>:8080
 #
 # 不需要 .env，也不需要预先生成任何密钥：管理密钥会在首次启动时自动生成
 # 并存在 data/ 里，管理台自己使用它，因此打开网页即可用。
 #
+# 管理台和 OpenAI 接口在同一个端口（和原桌面版一致），没有第二个端口。
+#
 # 可调项（一般不用改，按需加 environment:）：
-#   CHAT2API_API_KEY          给 8080 客户端访问加密钥（默认不启用）
-#   CHAT2API_BIND / 端口      改端口直接改下面 ports 左侧
+#   CHAT2API_API_KEY          给 /v1 客户端访问加密钥（默认不启用）
 #   TZ=Asia/Shanghai          日志时区，默认 UTC
 #   CHAT2API_ENABLE_WEBUI=false   不要管理台，只要 API
 services:
@@ -20,8 +21,7 @@ services:
     container_name: chat2api
     restart: unless-stopped
     ports:
-      - "8080:8080"   # OpenAI 兼容 API
-      - "8081:8081"   # Web 管理台
+      - "8080:8080"   # 管理台 + OpenAI 兼容 API 共用一个端口
     volumes:
       # 账号、配置、日志、凭证加密密钥都在这里。备份它就等于备份了全部状态。
       # 属主由容器启动时自动修正，不需要手工 chown。

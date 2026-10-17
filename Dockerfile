@@ -6,7 +6,11 @@
 # --------------
 # 上游是 Electron 桌面应用：OpenAI 兼容代理只在 GUI 的 IPC 初始化里启动，
 # 账号管理界面也只存在于 Electron 渲染层。本镜像把同一套代理代码跑在纯
-# Node.js 里（无 Chromium / 无 Xvfb），并自带一个轻量 Web 管理台补齐界面。
+# Node.js 里（无 Chromium / 无 Xvfb），并自带 Web 管理台。
+#
+# 对外只有一个端口：
+#   GET /             -> 管理台页面
+#   其余（/v1、/v0/management、/health）-> 转发给回环上的网关进程
 #
 # 三个关键机制
 # ------------
@@ -165,12 +169,14 @@ ENV NODE_ENV=production \
     CHAT2API_BUNDLE=/app/upstream/main/headless.js \
     CHAT2API_PORT=8080 \
     CHAT2API_HOST=0.0.0.0 \
-    CHAT2API_UI_PORT=8081 \
+    CHAT2API_INTERNAL_PORT=18080 \
+    CHAT2API_INTERNAL_HOST=127.0.0.1 \
     CHAT2API_ENABLE_WEBUI=true \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
-EXPOSE 8080 8081
+# 对外只暴露一个端口：管理台和 API 共用
+EXPOSE 8080
 
 # 不写 USER：entrypoint.sh 以 root 启动，先修正数据卷属主，再降权到 node 运行。
 # ENTRYPOINT 必须包含 entrypoint.sh，否则脚本根本不会被执行（CMD 只是它的参数）。

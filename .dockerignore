@@ -1,11 +1,12 @@
 data/
 .freshdata/
 .build/
-build/
 *.log
 .env
 .DS_Store
 node_modules/
 repo.tar.gz
 upstream-src.tar.gz
+ctx.tar.gz
 .verify-*/
+.verifybuild*/

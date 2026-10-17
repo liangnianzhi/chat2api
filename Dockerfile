@@ -8,12 +8,13 @@
 #
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
+#   GET  /__login      -> 引导式登录页（容器里无法开 Electron 窗口，见该页面注释）
 #   /v1、/health        -> 上游 Koa 应用（OpenAI 兼容 API）
 #   /management/*      -> 改写成 /v0/management/* 后转发
 #
 # 源码获取
 # --------
-# 从 codeload 下载上游 tarball。（网络受限的环境请用 CI 构建好的 GHCR 镜像。）
+# 从 codeload 下载上游 tarball。（网络受限的环境请用 CI 构建好的镜像。）
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
@@ -90,6 +91,7 @@ COPY shim/gateway.js /build/stage/shim/gateway.js
 COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
 COPY webui/server.js /build/stage/webui/server.js
 COPY webui/preload-bridge.js /build/stage/webui/preload-bridge.js
+COPY webui/login.html /build/stage/webui/login.html
 
 RUN set -eux; \
     mkdir -p /build/stage/upstream; \
@@ -145,7 +147,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# 只复制裁剪后的成果：依赖 + 编译产物 + 上游前端。
+# 只复制裁剪后的成果：依赖 + 编译产物 + 上游前端 + 自己的辅助页。
 COPY --from=builder /build/stage/ /app/
 
 RUN set -eux; \
@@ -158,6 +160,7 @@ RUN set -eux; \
     test -f /app/upstream/preload/index.js; \
     test -f /app/webui/server.js; \
     test -f /app/webui/preload-bridge.js; \
+    test -f /app/webui/login.html; \
     test -f /app/shim/gateway.js; \
     test -x /app/shim/entrypoint.sh; \
     chown -R node:node /app; \
@@ -172,6 +175,7 @@ ENV NODE_ENV=production \
     CHAT2API_RENDERER_DIR=/app/upstream/renderer \
     CHAT2API_PRELOAD_FILE=/app/upstream/preload/index.js \
     CHAT2API_BRIDGE_FILE=/app/webui/preload-bridge.js \
+    CHAT2API_LOGIN_PAGE=/app/webui/login.html \
     CHAT2API_PORT=8082 \
     CHAT2API_HOST=0.0.0.0 \
     CHAT2API_INTERNAL_PORT=8082 \

@@ -1,6 +1,6 @@
 name: build
 
-# Container testing happens here rather than on the NAS.
+# Container testing happens here rather than on a NAS or dev box.
 #
 # The weekly run rebuilds from upstream main on purpose: this deployment depends
 # on three upstream surfaces (store.ts's Electron imports, the vite config's
@@ -21,7 +21,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: chat2api-gateway
+  IMAGE_NAME: chat2api
   CHAT2API_REF: main
 
 jobs:
@@ -47,7 +47,7 @@ jobs:
           shellcheck --severity=error manage.sh tests/smoke.sh
 
   # ---------------------------------------------------------------------------
-  # Build, deploy, test - and publish on main/tags.
+  # Build, deploy, test - and publish to GHCR on main/tags.
   # ---------------------------------------------------------------------------
   build-test-publish:
     runs-on: ubuntu-latest
@@ -137,12 +137,9 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # 只维护单一的滚动 latest 标签。
           tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
       - name: Push image
         if: success() && github.event_name != 'pull_request'

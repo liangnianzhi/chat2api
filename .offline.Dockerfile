@@ -2,9 +2,12 @@
 # =============================================================================
 # 这是 Dockerfile 的**快速替代路径**，不是默认构建方式。
 #
-# 用途：在没有 buildx、磁盘 I/O 又慢的机器（例如群晖 NAS）上，Dockerfile 里的
-# `npm install`（约 500MB 层）提交会耗时数十分钟。这个路径直接复用一份已验证
-# 的运行目录（.build/app-runtime.tgz），省掉依赖安装与前端构建，几分钟出镜像。
+# 正常情况下不需要这个文件：镜像由 GitHub Actions 构建并推送到
+# ghcr.io/liangnianzhi/chat2api:latest，使用方只需 docker pull。
+#
+# 本路径用于没有 buildx、磁盘 I/O 又慢的宿主（例如群晖 NAS）：Dockerfile 里的
+# `npm install`（约 500MB 层）提交会耗时数十分钟。这里直接复用一份已验证的
+# 运行目录（.build/app-runtime.tgz），省掉依赖安装与前端构建，几分钟出镜像。
 #
 # 两者产出的运行内容完全一致：
 #   /app/upstream/main/headless.js   编译后的代理（含 Headless 入口）
@@ -12,26 +15,24 @@
 #   /app/shim/                       Electron 兼容层 + supervisor
 #   /app/webui/                      Web 管理台
 #
-# 要重新生成 app-runtime.tgz（例如上游更新后）：
-#   1) 先跑一次完整构建：
-#        ./manage.sh build
+# 用法：
+#   1) 先在别处跑一次完整构建（CI 或 ./manage.sh build）
 #   2) 从构建产物里导出运行目录：
-#        docker create --name tmp chat2api-gateway:latest
+#        docker create --name tmp chat2api:latest
 #        mkdir -p .build/app
 #        docker cp tmp:/app/. .build/app/
 #        tar czf .build/app-runtime.tgz -C .build/app .
 #        docker rm tmp
+#   3) ./manage.sh build-offline
 #
 # 注意：.build/app-runtime.tgz 是二进制产物，已在 .gitignore 里排除；
 # 想用本路径的人需要自己先产出一份（见上面步骤）。
-#
-# 平时请优先用 `./manage.sh build`（可复现）。
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
 FROM node:${NODE_VERSION}
 
-LABEL org.opencontainers.image.title="Chat2API Gateway" \
+LABEL org.opencontainers.image.title="Chat2API" \
       org.opencontainers.image.description="Headless OpenAI-compatible gateway for Chat2API with a web console (no Electron/Xvfb)" \
       org.opencontainers.image.source="https://github.com/liangnianzhi/chat2api" \
       org.opencontainers.image.licenses="GPL-3.0"

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 - Chat2API</title>
+<style>
+  :root {
+    --bg:#0f1115; --card:#171a21; --line:#262b36; --fg:#e6e9ef;
+    --muted:#8b93a7; --accent:#4c8dff; --ok:#3fb950; --err:#f85149; --warn:#d29922;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:720px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px; margin-bottom:16px; }
+  .card.fail { border-color:#5c2226; }
+  .card.ok { border-color:#1f4d2c; }
+  h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
+       text-transform:uppercase; letter-spacing:.04em; font-weight:600; }
+  label { display:block; font-size:12px; color:var(--muted); margin:12px 0 5px; }
+  textarea, input { width:100%; padding:9px 11px; background:#0c0e12; color:var(--fg);
+    border:1px solid var(--line); border-radius:6px; font:inherit; }
+  textarea { min-height:80px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; }
+  textarea:focus, input:focus { outline:none; border-color:var(--accent); }
+  button { padding:9px 16px; border:1px solid var(--line); background:#20242e; color:var(--fg);
+           border-radius:6px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.wide { width:100%; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .steps { margin:0; padding-left:20px; color:var(--muted); font-size:13px; }
+  .steps li { margin:7px 0; }
+  code { background:#0c0e12; padding:1.5px 6px; border-radius:4px; font-size:12px;
+         font-family:ui-monospace,Menlo,Consolas,monospace; color:#9fd0ff; }
+  .msg { padding:11px 13px; border-radius:6px; margin-top:12px; font-size:13px; display:none; }
+  .msg.show { display:block; }
+  .msg.ok { background:#12261a; color:var(--ok); border:1px solid #1f4d2c; }
+  .msg.err { background:#2d1416; color:var(--err); border:1px solid #5c2226; }
+  .msg.warn { background:#2b2413; color:var(--warn); border:1px solid #5c4a1f; }
+  .note { font-size:12px; color:var(--muted); margin-top:10px; }
+  .kv { font-size:13px; color:var(--muted); }
+  .kv b { color:var(--fg); font-weight:600; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:14px; }
+  .state { margin-top:14px; padding:12px; border-radius:6px; background:#0c0e12; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">登录</h1>
+  <div class="sub" id="subtitle">正在加载…</div>
+
+  <div class="card" id="badParams" style="display:none">
+    <h2>参数缺失</h2>
+    <p style="margin:0">这个页面需要由管理界面打开。请回到 Chat2API 界面，在「添加账号」里再试。</p>
+  </div>
+
+  <div id="main" style="display:none">
+    <div class="card">
+      <h2>第 1 步 · 打开登录页</h2>
+      <p style="margin:0 0 14px;color:var(--muted)">
+        登录页会在新标签页打开。登录成功后回到这里完成第 2 步。
+      </p>
+      <button class="primary wide" id="btnOpen">打开 <span id="siteName">登录页</span></button>
+      <div class="msg" id="openMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>第 2 步 · 取回登录凭证</h2>
+      <ol class="steps" id="steps"></ol>
+      <label id="fieldLabel" for="tokenInput">粘贴凭证</label>
+      <textarea id="tokenInput" placeholder="在这里粘贴"></textarea>
+      <div class="row">
+        <button class="primary" id="btnSubmit">保存并添加账号</button>
+        <button id="btnClear">清空</button>
+      </div>
+      <div class="msg" id="submitMsg"></div>
+      <div class="note" id="multiHint" style="display:none"></div>
+    </div>
+
+    <div class="card" id="extraCard" style="display:none">
+      <h2>附加字段</h2>
+      <div id="extraFields"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/*
+ * 容器里的登录取值页。
+ *
+ * 为什么是这样一个页面：上游的「网页登录」原本在 Electron 里开一个窗口，
+ * 用 webContents 直接读窗口里的 localStorage / cookie。容器里没有窗口，
+ * 所以那条路不可能跑通。
+ *
+ * 能做的：把「去哪登录」和「取哪个字段」这两件事讲清楚，让用户在自己的
+ * 浏览器里登录，然后把值交给容器。跨域站点无法被容器直接读取，这是浏览器
+ * 的安全边界，不是能绕过的实现细节。
+ *
+ * 因此这里是引导 + 校验 + 提交，而不是伪装成“全自动”。
+ */
+
+function qs(name) {
+  return new URLSearchParams(location.search).get(name) || '';
+}
+
+const cfg = {
+  provider: qs('provider'),
+  providerId: qs('providerId'),
+  field: qs('field'),
+  site: qs('site'),
+  loginUrl: qs('loginUrl'),
+  extra: qs('extra'),
+  origin: qs('origin'),
+};
+
+const PROVIDER_HINTS = {
+  deepseek: {
+    site: 'DeepSeek',
+    where: 'chat.deepseek.com',
+    steps: [
+      '点上方按钮打开 <b>chat.deepseek.com</b> 并登录',
+      '按 <code>F12</code> 打开开发者工具，切到 <b>Application</b> → <b>Local Storage</b>',
+      '展开 <code>https://chat.deepseek.com</code>，复制 <code>userToken</code> 的值',
+      '回到本页，粘贴到下方并保存',
+    ],
+  },
+  glm: {
+    site: 'GLM 智谱',
+    where: 'chatglm.cn',
+    steps: [
+      '点上方按钮打开 <b>chatglm.cn</b> 并登录',
+      '按 <code>F12</code> 打开开发者工具，切到 <b>Application</b> → <b>Cookies</b>',
+      '找到 <code>chatglm_refresh_token</code>，复制它的值',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  kimi: {
+    site: 'Kimi',
+    where: 'kimi.com',
+    steps: [
+      '点上方按钮打开 <b>kimi.com</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Cookies</b>',
+      '找到 <code>kimi-auth</code>，复制它的值（是一段 JWT）',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  minimax: {
+    site: 'MiniMax',
+    where: 'agent.minimaxi.com',
+    steps: [
+      '点上方按钮打开 <b>agent.minimaxi.com</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Local Storage</b>',
+      '复制 <code>_token</code> 的值',
+      '还需要 <code>user_detail_agent</code> 里的用户 ID，填在下方附加字段',
+    ],
+  },
+  qwen: {
+    site: '通义千问',
+    where: 'qianwen.com',
+    steps: [
+      '点上方按钮打开 <b>qianwen.com</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Cookies</b>',
+      '找到 <code>tongyi_sso_ticket</code>，复制它的值',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  perplexity: {
+    site: 'Perplexity',
+    where: 'perplexity.ai',
+    steps: [
+      '点上方按钮打开 <b>perplexity.ai</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Cookies</b>',
+      '把需要的 cookie 拼成 <code>name=value; name2=value2</code> 的形式',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  mimo: {
+    site: 'MiMo',
+    where: 'aistudio.xiaomimimo.com',
+    steps: [
+      '点上方按钮打开 <b>aistudio.xiaomimimo.com</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Cookies</b>',
+      '把需要的 cookie 拼成 <code>name=value; name2=value2</code> 的形式',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  zai: {
+    site: 'Z.ai',
+    where: 'chat.z.ai',
+    steps: [
+      '点上方按钮打开 <b>chat.z.ai</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Local Storage</b>',
+      '复制 token 项的值',
+      '回到本页，粘贴并保存',
+    ],
+  },
+  'qwen-ai': {
+    site: 'Qwen AI',
+    where: 'chat.qwen.ai',
+    steps: [
+      '点上方按钮打开 <b>chat.qwen.ai</b> 并登录',
+      '按 <code>F12</code> → <b>Application</b> → <b>Local Storage</b>',
+      '复制 token 项的值',
+      '回到本页，粘贴并保存',
+    ],
+  },
+};
+
+function showMsg(el, text, kind) {
+  el.textContent = text;
+  el.className = 'msg show ' + (kind || 'err');
+}
+function hideMsg(el) { el.className = 'msg'; }
+
+const hint = PROVIDER_HINTS[cfg.provider] || null;
+const loginUrl = cfg.loginUrl || (hint ? 'https://' + hint.where : '');
+const siteName = cfg.site || (hint ? hint.site : cfg.provider || '登录页');
+
+if (!cfg.provider) {
+  document.getElementById('badParams').style.display = '';
+  document.getElementById('subtitle').textContent = '';
+} else {
+  document.getElementById('main').style.display = '';
+  document.getElementById('title').textContent = '登录 ' + siteName;
+  document.getElementById('subtitle').textContent =
+    '在自己的浏览器里登录，然后把凭证交给容器 —— 凭证会被加密保存。';
+  document.getElementById('siteName').textContent = siteName + ' 登录页';
+
+  const stepsEl = document.getElementById('steps');
+  if (hint) {
+    stepsEl.innerHTML = hint.steps.map(function (s) { return '<li>' + s + '</li>'; }).join('');
+  } else {
+    stepsEl.innerHTML = '<li>打开登录页并登录</li><li>从开发者工具里取出 token 或 cookie</li><li>粘贴到下方保存</li>';
+  }
+
+  if (cfg.field) {
+    document.getElementById('fieldLabel').textContent = '粘贴 ' + cfg.field;
+    document.getElementById('tokenInput').placeholder = '粘贴 ' + cfg.field + ' 的值';
+  }
+
+  // 附加字段（例如 MiniMax 的 realUserID）
+  if (cfg.extra) {
+    const names = cfg.extra.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (names.length) {
+      document.getElementById('extraCard').style.display = '';
+      const box = document.getElementById('extraFields');
+      box.innerHTML = names.map(function (n) {
+        const id = 'extra_' + n.replace(/[^a-zA-Z0-9_]/g, '');
+        return '<label for="' + id + '">' + n + '</label>'
+          + '<input id="' + id + '" data-extra="' + n + '" placeholder="' + n + ' 的值">';
+      }).join('');
+    }
+  }
+
+  document.getElementById('btnOpen').onclick = function () {
+    if (!loginUrl) {
+      showMsg(document.getElementById('openMsg'), '这个提供商的登录地址未知，请手动打开官网登录。', 'warn');
+      return;
+    }
+    // 直接在当前手势里打开，不经后端，不会被拦。
+    const w = window.open(loginUrl, '_blank');
+    if (w) {
+      try { w.opener = null; } catch (e) {}
+      showMsg(document.getElementById('openMsg'), '已打开登录页，登录完成后回到本页做第 2 步。', 'ok');
+    } else {
+      showMsg(document.getElementById('openMsg'),
+        '浏览器拦截了新标签页，请手动打开：' + loginUrl, 'warn');
+    }
+  };
+
+  document.getElementById('btnClear').onclick = function () {
+    document.getElementById('tokenInput').value = '';
+    hideMsg(document.getElementById('submitMsg'));
+    document.querySelectorAll('[data-extra]').forEach(function (i) { i.value = ''; });
+  };
+
+  document.getElementById('btnSubmit').onclick = async function () {
+    const btn = this;
+    const msg = document.getElementById('submitMsg');
+    const value = document.getElementById('tokenInput').value.trim();
+
+    if (!value) { showMsg(msg, '请先填入凭证。', 'err'); return; }
+
+    const credentials = {};
+    if (cfg.field) credentials[cfg.field] = value;
+    else credentials.token = value;
+
+    document.querySelectorAll('[data-extra]').forEach(function (input) {
+      const v = input.value.trim();
+      if (v) credentials[input.getAttribute('data-extra')] = v;
+    });
+
+    btn.disabled = true;
+    showMsg(msg, '正在验证凭证…', 'ok');
+
+    try {
+      // 交给容器验证：验证通过才真正写入账号。
+      const resp = await fetch('/__login/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerId: cfg.providerId || cfg.provider,
+          providerType: cfg.provider,
+          credentials: credentials,
+        }),
+      });
+      const data = await resp.json();
+
+      if (data && data.ok) {
+        showMsg(msg, '登录成功，账号已添加。可以关闭本页了。', 'ok');
+        document.getElementById('tokenInput').value = '';
+        setTimeout(function () {
+          try { window.close(); } catch (e) {}
+        }, 1500);
+      } else {
+        const err = (data && data.error) || '验证失败';
+        showMsg(msg, '验证失败：' + err + '\n请确认复制的值完整、未过期。', 'err');
+      }
+    } catch (e) {
+      showMsg(msg, '提交失败：' + e.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+</script>
+</body>
+</html>

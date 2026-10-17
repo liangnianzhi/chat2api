@@ -10,7 +10,7 @@
 |---|---|
 | 镜像体积 | ~160 MB |
 | 常驻内存 | ~55 MB |
-| 端口 | **只要一个 8080**（界面 + API 共用，和桌面版一致） |
+| 端口 | **只要一个 8082**（界面 + API 共用，和桌面版一致） |
 | 界面 | **上游自己编译出来的前端**（不是重画的） |
 | 配置 | **零配置**：没有 .env，不需要任何密钥 |
 
@@ -23,7 +23,7 @@ mkdir -p data
 docker compose up -d
 ```
 
-浏览器打开 **`http://<主机IP>:8080`** —— 就是上游那个界面。
+浏览器打开 **`http://<主机IP>:8082`** —— 就是上游那个界面。
 
 就这三步。整个部署状态只有 `docker-compose.yml` 和 `data/` 两样东西。
 
@@ -36,11 +36,11 @@ docker compose up -d
 |---|---|
 | `GET /` | 上游原版界面 |
 | `/v1/*` | OpenAI 兼容 API（给客户端调用） |
-| `/v0/management/*` | 管理 API |
+| `/management/*` | 管理 API |
 | `/health` | 健康检查 |
 
-容器内部，网关只监听 `127.0.0.1:18080`，对外的单一入口是前端服务。
-所以宿主上只有一个端口需要发布。
+容器内部，网关只监听 `127.0.0.1:18090`，对外的单一入口是前端服务。
+所以宿主上只有一个端口（8082）需要发布。
 
 ### 客户端接入
 
@@ -48,7 +48,7 @@ docker compose up -d
 from openai import OpenAI
 client = OpenAI(
     api_key="在界面里生成的密钥",
-    base_url="http://192.168.1.10:8080/v1",
+    base_url="http://192.168.1.10:8082/v1",
 )
 print(client.chat.completions.create(
     model="deepseek-v4-flash",
@@ -56,13 +56,29 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
+## 管理 API 的路径：为什么是 `/management`
+
+上游自己用的是 **`/v0/management`** —— 这是它的原生路径，在好几处中间件里
+硬编码，改不掉。但它和 OpenAI 的 `/v1` 只差一个数字，很容易看错。
+
+所以容器在入口处做了别名：
+
+```
+/management/accounts   ->  /v0/management/accounts
+```
+
+行为完全一致（同一个处理器、同样需要密钥），只是一个更好记的名字。
+**两个前缀都能用**，文档一律写 `/management`。
+
+```bash
+curl http://127.0.0.1:8082/management/providers
+```
+
 ## 界面：为什么是上游原版
 
 上游的界面和全部交互逻辑本来就已经存在，重画一遍只会多一份需要跟着上游同步的代码。
 所以这里**直接把上游编译出来的前端（`out/renderer`）发出去**，把它的 IPC 调用接到
 **上游自己的 `ipcMain.handle` 实现**上。
-
-三条链路：
 
 ```
 浏览器                     前端服务（容器内）                 网关进程
@@ -73,25 +89,21 @@ print(client.chat.completions.create(
   │ ◄── SSE /__ipc/events ───────┼──◄── webContents.send 事件 ────┤
 ```
 
-- **`/__preload.js` 是上游自己的 preload 产物**，外面包了一层 `require` 垫片让它能
+- **`/__preload.js` 是上游自己的 preload 产物**，外面包一层 `require` 垫片让它能
   在浏览器里跑。它照旧调用 `contextBridge.exposeInMainWorld('electronAPI', ...)`，
-  所以 `window.electronAPI` 的形状、channel 名全部与上游一致，
-  没有任何手写的 channel 名单需要维护。
-- **shim 把 `ipcMain.handle` 登记下来**而不是当空函数。上游约 150 个 channel
-  就这么原样可用。
-- **事件走 SSE**：`webContents.send` 被接到事件总线上，所以代理状态、
-  配置变更、OAuth 进度都能到页面。
-- **`shell.openExternal` 变成新标签页**：外部链接（OAuth、文档）由浏览器打开。
+  所以 `window.electronAPI` 的形状、channel 名全部与上游一致。
+- **shim 把 `ipcMain.handle` 登记下来**而不是当空函数，上游约 150 个 channel 原样可用。
+- **事件走 SSE**：代理状态、配置变更、OAuth 进度都能到页面。
+- **`shell.openExternal` 变成新标签页**：外部链接由浏览器打开。
 
-因为前端服务要和网关**同进程**（注册表在那边），它由 supervisor `require` 进来，
-而不是单独起一个进程。
+前端服务与网关**同进程**（注册表在那边），由 supervisor `require` 进来。
 
-如果上游某次改动导致这些处理器无法在无头下初始化，容器会**自动降级**到内置的
-轻量控制台（`/_ui/health` 会显示 `"ui":"fallback"`），API 始终可用。
+**没有降级方案**：如果上游界面发不出来，容器会直接报错（`/_ui` 返回 500 说明原因），
+而不是偷偷换成一个别的界面。API 始终可用。
 
 ## 无头环境下仍不可用的功能
 
-只有 Qwen 的**风控验证码窗**（`captchaWindow.ts`）真正依赖浏览器内核。它做的事是：
+只有 Qwen 的**风控验证码窗**（`captchaWindow.ts`）真正依赖浏览器内核。它做三件事：
 
 1. 用**容器内的持久会话**载入风控 "punish" 页面
 2. 用 `executeJavaScript` 在页面里探测滑块、自动拖动、判断是否通过
@@ -102,7 +114,7 @@ print(client.chat.completions.create(
 
 **实际可行的做法**（不需要额外成本）：
 
-1. 在界面里点该账号的验证入口，把 punish 链接在新标签页打开
+1. 在界面里触发验证，把 punish 链接在新标签页打开
 2. 手动完成滑块
 3. 在该页控制台执行 `copy(document.cookie)`，把结果粘回界面
 4. 容器把 cookie 合并进账号并重试那笔请求
@@ -124,7 +136,7 @@ token/cookie，不受影响。
 ```yaml
 # 只绑定到本机
 ports:
-  - "127.0.0.1:8080:8080"
+  - "127.0.0.1:8082:8082"
 ```
 
 若需要直连管理 API（例如写脚本），可从容器里取密钥：
@@ -163,7 +175,6 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 ## 实现原理
 
 上游是 Electron 桌面应用：代理在 GUI 的 IPC 初始化里启动，界面只存在于渲染层。
-下文只说代理部分（界面部分见上一节）。
 
 整个代理层 92 个源文件里**只有 3 个**碰 Electron：
 
@@ -197,43 +208,41 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 - `BrowserWindow`：构造仍抛错（无头下无意义），但 `getAllWindows()` 返回一个桩，
   让上游的广播循环能到达事件总线。
 - `Tray` / `Menu` / `nativeImage`：**惰性空实现**而不是抛错 ——
-  `registerIpcHandlers` 会在代理启停时调用 `TrayManager.updateProxyStatus()`，
-  抛错会弄坏界面自己的按钮。
+  `registerIpcHandlers` 会在代理启停时调用 `TrayManager.updateProxyStatus()`。
 - `net`：Node `http`/`https`，支持 `HTTPS_PROXY`。
 
 **3. 用 shim 替换 `node_modules/electron`**
 
 编译产物和 Rollup 拆出的 `chunks/*.js` 都会 `require('electron')`，且分块位置会随上游
-重构变化。改编译产物需要每次重新验证；换包是一次性拦截所有调用点。
+重构变化。换包是一次性拦截所有调用点。
 
 **4. 单一入口 `webui/server.js`**
 
 一个零依赖 HTTP 服务拥有唯一对外端口：发上游前端、桥接 IPC 与事件、
-把 `/v1`、`/v0`、`/health` 反代到回环网关，并在转发 `/v0/management/*` 时附上密钥。
+把 `/v1`、`/v0`、`/health` 反代到回环网关并附上密钥，同时提供 `/management` 别名。
 
 ## 上游更新与 CI
 
 镜像由 `.github/workflows/ci.yml` 构建：
 
 ```
-lint → 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 → 推送 GHCR
+lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 → 推送 GHCR
 ```
 
 触发：push、PR、tag、手动，外加**每周一次定时构建**。
 
 > 为什么要定时构建：本方案依赖上游若干内部结构（`store.ts` 的 Electron 引用、
 vite 配置的 `rollupOptions.input` 结构、`ipc/handlers.ts` 的注册方式、
-preload 的输出格式）。上游更新很快，定时构建能把「上游悄悄改坏了」变成一次
-失败的任务，而不是你某天 pull 到最新版才发现。
+preload 的输出格式）。定时构建能把「上游悄悄改坏了」变成一次失败的任务。
 
 冒烟测试（`tests/smoke.sh`）覆盖：
 
-- 无头运行、单端口布局、网关只绑回环、镜像内无 Chromium/Xvfb
+- 无头运行、单端口 8082、网关只绑回环 18090、镜像内无 Chromium/Xvfb
 - 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权到 uid 1000
 - **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
-- **前端来自上游 `out/renderer`**、IPC 处理器已登记（>100 个 channel）、
-  页面注入了 preload 桥、静态资源可访问、`/__ipc` 能派发真实 channel
-- 同一端口上：`/v1/models`、`/v0/management/*`、`/health`
+- 上游界面已就绪、preload 桥注入、静态资源可访问、`/__ipc` 能派发真实 channel
+- **`/management` 与 `/v0/management` 状态码与结构一致**
+- `/v1/models`、`/health`
 - 添加账号 → 列表可见、凭证已掩码；生成客户端 API 密钥
 - AES-GCM 加解密往返、密文不含明文、篡改可检测
 - 加密密钥与管理密钥均持久化在数据卷；`data.json` 为密文
@@ -246,9 +255,9 @@ preload 的输出格式）。上游更新很快，定时构建能把「上游悄
 IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 ```
 
-上游版本通过 `.github/workflows/ci.yml` 里的 `CHAT2API_REF` 控制（默认 `main`，
-可改为 `v1.7.16` 之类锁定）。构建时若 `out/main/headless.js`、`out/renderer/index.html`
-或 `out/preload/index.js` 任一未产出，Dockerfile 会**直接失败报警**。
+上游版本通过 `.github/workflows/ci.yml` 里的 `CHAT2API_REF` 控制。构建时若
+`out/main/headless.js`、`out/renderer/index.html` 或 `out/preload/index.js`
+任一未产出，Dockerfile 会**直接失败报警**。
 
 ## 目录结构
 
@@ -265,8 +274,7 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 │   ├── entrypoint.sh           # 修正数据卷属主后降权运行
 │   └── gateway.js              # supervisor：装 shim、起网关与前端服务
 ├── webui/
-│   ├── server.js               # 唯一对外端口：上游前端 + IPC 桥 + 反向代理
-│   └── index.html              # 降级控制台（上游界面不可用时才发）
+│   └── server.js               # 唯一对外端口：上游前端 + IPC 桥 + 反向代理
 ├── tests/smoke.sh
 └── .github/workflows/ci.yml
 ```
@@ -282,12 +290,11 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
    镜像，其中仅 `electron` 一个就 315MB（未压缩）。
 2. 在同一阶段里「先装后删」不减小镜像。镜像按层累积，后续层删除只记 whiteout 标记。
 
-改成两阶段（builder 里编译+裁剪，运行时只 `COPY` 结果）后：
+改成两阶段后：
 
 | 项目 | 之前 | 现在 |
 |---|---|---|
 | 镜像体积 | 1.01 GB | **~160 MB** |
-| `node_modules` | 302 MB / 245 包 | 几 MB |
 | 常驻内存 | — | ~55 MB |
 
 裁剪依据是上游 `electron.vite.config.ts` 里 `externalizeDepsPlugin` 的 `exclude` 列表；
@@ -295,15 +302,16 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 
 ## 常见问题
 
-**拉取镜像 403 / denied**
-GHCR 包默认私有。在 Packages → chat2api → Package settings 改为 Public，或先 `docker login ghcr.io`。
+**拉取镜像 403 / denied / 一直卡住**
+GHCR 包默认私有，匿名拉取会被卡住。在 Packages → chat2api → Package settings
+改为 Public，或先 `docker login ghcr.io`。
 
-**8080 打不开**
+**8082 打不开**
 `docker compose logs` 看日志。确认端口没被占用。
 
-**界面变成内置降级页了**
-看启动日志里有没有 `IPC bridge unavailable` —— 说明上游改了 `ipc/handlers.ts` 的注册方式，
-需要适配。API 不受影响。`/ _ui/health` 可确认当前用的是哪一套。
+**界面打不开但 /v1 正常**
+看日志里有没有 `IPC bridge unavailable` —— 说明上游改了 `ipc/handlers.ts` 的注册方式，
+需要适配。API 不受影响。
 
 **`/health` 正常但调用报错**
 若是 DeepSeek/GLM 报签名相关错误，说明镜像太旧（缺 `process.resourcesPath` 修复），

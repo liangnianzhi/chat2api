@@ -32,30 +32,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_container() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$CONTAINER" \
+    -p "127.0.0.1:${API_PORT}:8080" \
+    -p "127.0.0.1:${UI_PORT}:8081" \
+    -v "$WORKDIR/data:/data" \
+    -e CHAT2API_MANAGEMENT_SECRET="$1" \
+    "$IMAGE" >/dev/null
+}
+
+wait_ready() {
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 info "准备：数据卷与容器"
 # ---------------------------------------------------------------------------
 mkdir -p "$WORKDIR/data"
 chmod 777 "$WORKDIR/data"
-
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" \
-  -p "127.0.0.1:${API_PORT}:8080" \
-  -p "127.0.0.1:${UI_PORT}:8081" \
-  -v "$WORKDIR/data:/data" \
-  -e CHAT2API_MANAGEMENT_SECRET="$SECRET" \
-  "$IMAGE" >/dev/null
+start_container "$SECRET"
 
 # ---------------------------------------------------------------------------
 info "启动与健康检查"
 # ---------------------------------------------------------------------------
-ready=0
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then ready=1; break; fi
-  sleep 2
-done
-
-if [ "$ready" = 1 ]; then
+if wait_ready; then
   pass "容器在 120s 内就绪"
 else
   fail "容器未就绪，日志如下："
@@ -75,7 +80,8 @@ grep -q 'management API is enabled' <<<"$LOGS" \
   && pass "仅凭密钥自动启用了管理 API" || fail "管理 API 未自动启用"
 
 # 无头构建不应出现 Chromium / Xvfb 相关依赖
-if docker run --rm --entrypoint sh "$IMAGE" -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
+if docker run --rm --entrypoint sh "$IMAGE" \
+     -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
   fail "镜像里存在 Xvfb/Chromium/electron 可执行文件"
 else
   pass "镜像内无 Xvfb / Chromium / electron 可执行文件"
@@ -99,11 +105,13 @@ CODE_NOAUTH="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_POR
 [ "$CODE_NOAUTH" = 401 ] \
   && pass "无密钥访问管理 API -> 401" || fail "无密钥应返回 401，实际 $CODE_NOAUTH"
 
-CODE_BADAUTH="$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong-secret' "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
+CODE_BADAUTH="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H 'Authorization: Bearer wrong-secret' "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
 [ "$CODE_BADAUTH" = 401 ] \
   && pass "错误密钥 -> 401" || fail "错误密钥应返回 401，实际 $CODE_BADAUTH"
 
-CODE_OK="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
+CODE_OK="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
 [ "$CODE_OK" = 200 ] \
   && pass "正确密钥 -> 200" || fail "正确密钥应返回 200，实际 $CODE_OK"
 
@@ -125,12 +133,13 @@ info "账号写入与读取"
 # ---------------------------------------------------------------------------
 CREATE="$(curl -fsS -X POST "http://127.0.0.1:${UI_PORT}/v0/management/accounts" \
   -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' \
-  -d '{"providerId":"deepseek","name":"smoke-account","credentials":{"token":"smoke-token-value"}}' || echo '') 
-
+  -d '{"providerId":"deepseek","name":"smoke-account","credentials":{"token":"smoke-token-value"}}' \
+  || echo '')"
 grep -q '"success":true' <<<"$CREATE" \
   && pass "添加账号成功" || fail "添加账号失败: $CREATE"
 
-LIST="$(curl -fsS -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '') 
+LIST="$(curl -fsS -H "Authorization: Bearer $SECRET" \
+  "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$LIST" \
   && pass "账号出现在列表中" || fail "列表中未找到新账号: $LIST"
 
@@ -156,7 +165,10 @@ if (s.safeStorage.isEncryptionAvailable() !== true) { console.error("not availab
 const enc = s.safeStorage.encryptString(secret);
 if (s.safeStorage.decryptString(enc) !== secret) { console.error("roundtrip failed"); process.exit(1) }
 if (enc.toString("utf8").includes(secret)) { console.error("ciphertext contains plaintext"); process.exit(1) }
-try { s.safeStorage.decryptString(Buffer.from(enc.toString("utf8").replace(/^v1:/, "v1:x"))); console.error("tamper not detected"); process.exit(1) } catch {}
+try {
+  s.safeStorage.decryptString(Buffer.from(enc.toString("utf8").replace(/^v1:/, "v1:x")));
+  console.error("tamper not detected"); process.exit(1);
+} catch {}
 console.log("ok");
 ' >/dev/null 2>&1; then
   pass "加解密往返、无明文泄露、篡改可检测"
@@ -171,46 +183,38 @@ else
   fail "加密密钥未落在数据卷"
 fi
 
+# data.json 必须是密文。用 JSON.parse 判定而非字节启发式，否则二进制数据可能误判。
+if docker exec "$CONTAINER" node -e '
+const fs = require("fs");
+try { JSON.parse(fs.readFileSync("/data/.chat2api/data.json", "utf8")); process.exit(1) }
+catch { process.exit(0) }
+' >/dev/null 2>&1; then
+  pass "data.json 为密文"
+else
+  fail "data.json 可直接解析为 JSON（应为密文）"
+fi
+
 # ---------------------------------------------------------------------------
 info "重启后配置与账号持久化"
 # ---------------------------------------------------------------------------
 docker restart "$CONTAINER" >/dev/null
-ready=0
-for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then ready=1; break; fi
-  sleep 2
-done
-[ "$ready" = 1 ] && pass "重启后容器就绪" || fail "重启后容器未就绪"
+if wait_ready; then pass "重启后容器就绪"; else fail "重启后容器未就绪"; fi
 
-AFTER="$(curl -fsS -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '') 
+AFTER="$(curl -fsS -H "Authorization: Bearer $SECRET" \
+  "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$AFTER" \
   && pass "重启后账号仍在" || fail "重启后账号丢失: $AFTER"
-
-DATAJSON="$(docker exec "$CONTAINER" head -c 40 /data/.chat2api/data.json 2>/dev/null || echo '')"
-if [[ "$DATAJSON" == *'"'* ]]; then
-  fail "data.json 看起来是明文（应加密）"
-else
-  pass "data.json 为密文"
-fi
 
 # ---------------------------------------------------------------------------
 info "管理密钥改自环境变量"
 # ---------------------------------------------------------------------------
-docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" \
-  -p "127.0.0.1:${API_PORT}:8080" \
-  -p "127.0.0.1:${UI_PORT}:8081" \
-  -v "$WORKDIR/data:/data" \
-  -e CHAT2API_MANAGEMENT_SECRET="$NEW_SECRET" \
-  "$IMAGE" >/dev/null
+start_container "$NEW_SECRET"
+if wait_ready; then pass "换密钥后容器就绪"; else fail "换密钥后容器未就绪"; fi
 
-for _ in $(seq 1 60); do
-  curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1 && break
-  sleep 2
-done
-
-CODE_NEW="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $NEW_SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
-CODE_OLD="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
+CODE_NEW="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $NEW_SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
+CODE_OLD="$(curl -s -o /dev/null -w '%{http_code}' \
+  -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
 [ "$CODE_NEW" = 200 ] \
   && pass "新密钥生效（环境变量优先）" || fail "新密钥应生效，实际 $CODE_NEW"
 [ "$CODE_OLD" = 401 ] \

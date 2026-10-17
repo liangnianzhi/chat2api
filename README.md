@@ -9,7 +9,7 @@
 | 项目 | 实测 |
 |---|---|
 | 镜像体积 | ~160 MB |
-| 常驻内存 | ~55 MB |
+| 常驻内存 | ~51 MB |
 | 端口 | **只有一个 8082** |
 | 界面 | **上游自己编译出来的前端**（不是重画的） |
 | 配置 | **零配置**：没有 .env，不需要任何密钥 |
@@ -32,7 +32,7 @@ docker compose up -d
 
 ## 端口：只有一个
 
-**对宿主机而言，只有 8082 一个端口**，界面和 API 都在它上面：
+**宿主机上只有 8082 一个端口**，界面和 API 都在它上面：
 
 | 路径 | 作用 |
 |---|---|
@@ -41,9 +41,16 @@ docker compose up -d
 | `/management/*` | 管理 API |
 | `/health` | 健康检查 |
 
-容器内部还有一个**回环地址**供网关自己监听。它是实现细节，**不会发布到宿主**：
-上游的 `ProxyServer` 必须绑定一个具体端口，而 8082 被前端服务占着
-（发界面 + 桥接 IPC），所以内部拆成两段。你不需要配置它、也不需要记住它。
+容器内也**只有一个监听端口**。上游的 `ProxyServer` 本来要自己 `listen` 一个端口，
+这里在 `http.Server.prototype.listen` 处把它拦下来，直接拿它注册的请求处理器
+在 8082 上处理——所以没有第二个端口、也没有回环转发。
+
+启动日志会明确说明：
+
+```
+[shim] captured the HTTP request handler on :18090 (single port)
+[front] API: served in-process, no second port
+```
 
 ### 客户端接入
 
@@ -83,7 +90,7 @@ return { success: false, error: '请在浏览器登录后手动填入 Token' }
 
 也就是说，那个按钮的作用**就是帮你打开厂商登录页**，剩下取 token、贴回界面由你手动完成。
 
-所以这里修掉了一个真实缺陷：原来 `shell.openExternal` 只是把事件广播到
+这里修掉了一个真实缺陷：原来 `shell.openExternal` 只是把事件广播到
 SSE 通道，而 OAuth 调用时页面往往还没建立连接，**广播给了没人收**，
 点击后看起来毫无反应。现在：
 
@@ -100,12 +107,13 @@ SSE 通道，而 OAuth 调用时页面往往还没建立连接，**广播给了�
 **上游自己的 `ipcMain.handle` 实现**上。
 
 ```
-浏览器                     前端服务（容器内）                 网关进程
+浏览器                     前端服务（容器内）                 上游代码
   │                              │                              │
   │ GET /                        │ 发 out/renderer/index.html   │
   │                              │ 注入 <base> + preload 桥       │
   │ POST /__ipc {channel,args} ──┼──► 派发 ─────────────────────► ipcMain.handle 注册表
   │ ◄── SSE /__ipc/events ───────┼──◄── webContents.send 事件 ────┤
+  │ /v1、/management/* ───────────┼──► 直接交给被捕获的请求处理器 ──┤
 ```
 
 - **`/__preload.js` 是上游自己的 preload 产物**，前面接一层 `require` 垫片
@@ -113,7 +121,7 @@ SSE 通道，而 OAuth 调用时页面往往还没建立连接，**广播给了�
   `contextBridge.exposeInMainWorld('electronAPI', ...)`，所以 channel 名全部与上游一致。
 - **shim 把 `ipcMain.handle` 登记下来**而不是当空函数，上游约 150 个 channel 原样可用。
 - **事件走 SSE**：代理状态、配置变更、OAuth 进度都能到页面。
-- **`shell.openExternal` → 新标签页**：见上一节。
+- **API 直接交给上游处理器**：见端口一节。
 
 **没有降级界面**：如果上游界面发不出来，直接返回错误说明原因，
 不会偷偷换成别的页面。API 始终可用。
@@ -161,7 +169,7 @@ docker compose exec chat2api cat /app/UPSTREAM_INFO   # 当前上游版本
 tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 ```
 
-**备份 `data/` 是唯一需要在意的事** —— 里面的 `.safe-storage-key` 是凭证加密密钥，
+**`data/` 是唯一需要备份的东西** —— 里面的 `.safe-storage-key` 是凭证加密密钥，
 丢了等于全部账号作废。
 
 ## 数据卷权限
@@ -190,9 +198,9 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 
 那不是标签，而是**镜像摘要（digest）**：内容寻址的哈希，不可变。
 
-之前一次运行会出现**两个** digest，是因为旧流程构建了两次：
-先 `load` 一份供测试，再 `build --push` 完整重建一份用于推送。
-现在只构建一次，直接用测过的那份推送，所以**一次运行 = 一个 digest**。
+早先一次运行会出现**两个** digest，因为旧流程构建了两次：先 `load` 一份供测试，
+再 `build --push` 完整重建一份用于推送。现在只构建一次，直接用测过的那份推送，
+所以**一次运行 = 一个 digest**。
 
 ```bash
 docker image inspect ghcr.io/liangnianzhi/chat2api:latest \
@@ -213,13 +221,15 @@ lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 comp
 
 冒烟测试覆盖：
 
-- 无头运行、**只有一个发布端口**、镜像内无 Chromium/Xvfb
+- **只有一个发布端口**、API 在进程内处理、容器内无 18090 监听
+- 上游代理仍自报 running（证明 listen 回调被正确触发）
+- 无头运行、镜像内无 Chromium/Xvfb
 - 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权
+- 时区为 Asia/Shanghai（TZ + `/etc/localtime` + `+0800` 偏移）
 - **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
 - 上游界面已就绪、preload 桥注入、静态资源可访问、`/__ipc` 能派发真实 channel
 - **浏览器打开链路**（OAuth 依赖）+ 无订阅者时请求排队不丢失
 - **`/management` 与 `/v0/management` 状态码与结构一致**
-- `/v1/models`、`/health`
 - 账号增删、凭证掩码、客户端 API 密钥
 - AES-GCM 加解密往返、密文不含明文、篡改可检测
 - 加密密钥与管理密钥均持久化；**重启后账号与密钥均不变**
@@ -230,10 +240,6 @@ lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 comp
 ```bash
 IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 ```
-
-上游版本由工作流里的 `CHAT2API_REF` 控制（默认 `main`）。构建时若
-`out/main/headless.js`、`out/renderer/index.html` 或 `out/preload/index.js`
-任一未产出，Dockerfile 会**直接失败报警**。
 
 ## 实现原理（代理部分）
 
@@ -270,6 +276,20 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 **3. 用 shim 替换 `node_modules/electron`**：编译产物和 Rollup 拆出的
 `chunks/*.js` 都会 `require('electron')`，换包是一次性拦截所有调用点。
 
+**4. 单端口捕获（`http.Server.prototype.listen`）**
+
+上游的 `ProxyServer` 要自己 `listen` 一个端口。拦 `Koa.prototype.listen` **不行**：
+`electron-vite` 把依赖内联进 bundle，上游用的 Koa 是**私有副本**，
+在外部 patch `node_modules/koa` 打的是另一个对象，拦截永远不会触发
+（实测 bundle 只用 Node 内置模块，从不 `require('koa')`）。
+
+Node 的 `http` 模块是共享的，所以改在 `http.Server.prototype.listen` 拦截：
+
+- 摘下该 server 已有的 `request` 监听器，组成一个处理器发布为 `__httpHandler`
+- 返回一个「已监听」的替身对象（不绑 socket）
+- **调用上游传入的 callback** —— `proxyStatusManager.start()`/`setPort()` 都在里面，
+  不调用的话界面会显示代理「已停止」而实际在服务
+
 ## 目录结构
 
 ```
@@ -281,11 +301,11 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 │   ├── headless-entry.ts       # 无头启动入口（编进上游 bundle）
 │   ├── patch-vite-config.js    # 给 vite 配置追加 headless 入口
 │   ├── prune-deps.js           # 裁剪 node_modules
-│   ├── electron-shim.js        # Electron 兼容层 + IPC 登记 + 事件总线
+│   ├── electron-shim.js        # Electron 兼容层 + IPC 登记 + 单端口捕获
 │   ├── entrypoint.sh           # 修正数据卷属主后降权运行
 │   └── gateway.js              # supervisor：装 shim、起网关与前端服务
 ├── webui/
-│   ├── server.js               # 唯一对外端口：前端 + IPC 桥 + 反向代理
+│   ├── server.js               # 唯一对外端口：前端 + IPC 桥 + 直连 API
 │   └── preload-bridge.js       # 浏览器侧的 preload 垫片
 ├── tests/smoke.sh
 └── .github/workflows/ci.yml
@@ -317,7 +337,8 @@ GHCR 包默认私有，匿名拉取会被卡住。改为 Public，或先 `docker
 登录后仍需手动贴 token。
 
 **界面打不开但 /v1 正常**
-看日志里有没有 `IPC bridge unavailable` —— 上游改了 `ipc/handlers.ts` 的注册方式。
+看日志里有没有 `captured the HTTP request handler` 和
+`API: served in-process` —— 缺前者说明上游改了监听方式。
 
 ## 许可
 

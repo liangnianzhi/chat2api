@@ -1,0 +1,8 @@
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig))
+
+  return server
+}
+
+module.exports = { start }
+
+if (require.main === module) start()

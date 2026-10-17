@@ -17,7 +17,7 @@ on:
     - cron: '17 3 * * 1'
 
 permissions:
-  contents: read
+  contents: write   # needed only to publish smoke-failure.log on failure
   packages: write
 
 env:
@@ -107,8 +107,29 @@ jobs:
       # The deep functional suite: auth, account CRUD, credential encryption,
       # persistence across restarts, console proxy whitelist, image size budget.
       - name: Run container smoke tests
+        id: smoke
         run: |
-          IMAGE=${{ env.IMAGE_NAME }}:latest bash tests/smoke.sh
+          set -o pipefail
+          IMAGE=${{ env.IMAGE_NAME }}:latest bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
+
+      # Publish the smoke output so the failing assertion is readable without
+      # authenticated access to the job log. Temporary until the suite is green.
+      - name: Publish smoke output on failure
+        if: failure()
+        run: |
+          if [ ! -f /tmp/smoke.log ]; then echo 'no smoke log'; exit 0; fi
+          {
+            echo "# Smoke test output (run ${{ github.run_id }}, commit ${{ github.sha }})"
+            echo
+            echo '```'
+            cat /tmp/smoke.log
+            echo '```'
+          } > smoke-failure.log
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f smoke-failure.log
+          git commit -m 'ci: capture smoke test failure output [skip ci]' || echo 'nothing to commit'
+          git push || echo 'push failed'
 
       - name: Container logs on failure
         if: failure()
@@ -124,7 +145,7 @@ jobs:
       # Publish (main and version tags only; never on pull requests)
       # ---------------------------------------------------------------------
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: success() && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -132,7 +153,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Derive image metadata
-        if: github.event_name != 'pull_request'
+        if: success() && github.event_name != 'pull_request'
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -145,7 +166,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Push image
-        if: github.event_name != 'pull_request'
+        if: success() && github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .

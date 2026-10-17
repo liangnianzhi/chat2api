@@ -87,7 +87,6 @@ grep -q 'electron shim active' <<<"$LOGS" \
 grep -q '\[front\] Chat2API ready on http://0.0.0.0:8082' <<<"$LOGS" \
   && pass "对外只监听 8082" || fail "未在 8082 就绪"
 
-# 除 8082 外不应有其它端口对宿主可见（内部端口只绑回环）。
 PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sort -u | tr '\n' ' ')"
 if [ "$(echo "$PORTS" | wc -w)" = "1" ] && [[ "$PORTS" == *":${PORT}"* ]]; then
   pass "宿主机只有 1 个发布端口（$PORTS）"
@@ -170,27 +169,30 @@ grep -q '"ok":true' <<<"$IPC_ACC" \
 # ---------------------------------------------------------------------------
 info "浏览器打开（OAuth 登录依赖这条链路）"
 # ---------------------------------------------------------------------------
-# OAuth 在这里就是「打开厂商登录页，再手动贴回 token」。若这一步失效，
-# 点登录毫无反应 —— 所以必须单独断言，而不是等用户去发现。
+# OAuth 在这里就是「打开厂商登录页，再手动贴回 token」。这一步一旦失效，
+# 点登录就毫无反应，所以单独断言。
+#
+# 必须经由运行中的进程触发：docker exec 起的是另一个进程，它的事件总线
+# 与主进程不是同一个，测不通也是必然。
 SSE_FILE="$WORKDIR/sse.txt"
 : > "$SSE_FILE"
-( curl -sS --max-time 12 -N "http://127.0.0.1:${PORT}/__ipc/events" > "$SSE_FILE" 2>/dev/null & )
+( curl -sS --max-time 15 -N "http://127.0.0.1:${PORT}/__ipc/events" > "$SSE_FILE" 2>/dev/null & )
 sleep 2
-docker exec "$CONTAINER" node -e '
-const s = require("/app/shim/electron-shim.js");
-s.shell.openExternal("https://chat.deepseek.com");
-' >/dev/null 2>&1
+
+curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
+  -H 'Content-Type: application/json' \
+  -d '{"channel":"app:openExternal","args":["https://chat.deepseek.com"]}' >/dev/null 2>&1 || true
+
 sleep 3
 if grep -q 'chat.deepseek.com' "$SSE_FILE" 2>/dev/null; then
-  pass "shell.openExternal 会推送到界面（可用于打开登录页）"
+  pass "openExternal 事件会送达界面（可打开登录页）"
 else
-  fail "shell.openExternal 未到达事件流：$(head -c 200 "$SSE_FILE" 2>/dev/null)"
+  fail "openExternal 事件未到达事件流：$(head -c 200 "$SSE_FILE" 2>/dev/null)"
 fi
 
-# 没有订阅者时应当排队，而不是丢弃。
+# 无订阅者时应排队保留，而不是静默丢弃。
 QUEUED_OUT="$(docker exec "$CONTAINER" node -e '
 const s = require("/app/shim/electron-shim.js");
-// 没有客户端连接时调用：应被排队。
 s.shell.openExternal("https://queued.example/probe")
   .then(() => console.log("queued"))
   .catch((e) => console.log("error:" + e.message));

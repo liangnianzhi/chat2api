@@ -7,8 +7,7 @@
 #
 #   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
-# Deployment is zero-config and single-port on 8082: the upstream UI, the OpenAI
-# routes and the management API are all reached through that one address.
+# Deployment is zero-config and single-port on 8082.
 
 set -uo pipefail
 
@@ -80,16 +79,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-info "无头运行与单端口布局"
+info "只有一个对外端口"
 # ---------------------------------------------------------------------------
 LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
 grep -q 'electron shim active' <<<"$LOGS" \
   && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
-grep -q '\[front\] listening on http://0.0.0.0:8082' <<<"$LOGS" \
-  && pass "单一入口监听 8082" || fail "前端服务未在 8082 监听"
-grep -q 'gateway listening on 127.0.0.1:18090' <<<"$LOGS" \
-  && pass "网关只监听回环 18090（不对外暴露第二个端口）" \
-  || fail "网关未按预期绑定 127.0.0.1:18090"
+grep -q '\[front\] Chat2API ready on http://0.0.0.0:8082' <<<"$LOGS" \
+  && pass "对外只监听 8082" || fail "未在 8082 就绪"
+
+# 除 8082 外不应有其它端口对宿主可见（内部端口只绑回环）。
+PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sort -u | tr '\n' ' ')"
+if [ "$(echo "$PORTS" | wc -w)" = "1" ] && [[ "$PORTS" == *":${PORT}"* ]]; then
+  pass "宿主机只有 1 个发布端口（$PORTS）"
+else
+  fail "发布端口异常: $PORTS"
+fi
 
 if docker run --rm --entrypoint sh "$IMAGE" \
      -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
@@ -135,6 +139,8 @@ grep -qi '<div id="root"\|<div id="app"' <<<"$INDEX" \
 PRELOAD="$(curl -fsS "http://127.0.0.1:${PORT}/__preload.js" || echo '')"
 grep -q 'contextBridge' <<<"$PRELOAD" \
   && pass "preload 桥已就绪（含 contextBridge）" || fail "preload 内容异常"
+grep -q '__c2a_require' <<<"$PRELOAD" \
+  && pass "preload 桥含 require 垫片" || fail "preload 缺少垫片"
 
 ASSET="$(grep -oE '(src|href)="[^"]*/assets/[^"]+"' <<<"$INDEX" | head -1 | sed 's/.*="//;s/"$//')"
 ASSET="${ASSET#./}"
@@ -162,6 +168,40 @@ grep -q '"ok":true' <<<"$IPC_ACC" \
   || fail "IPC 桥派发失败: $IPC_ACC"
 
 # ---------------------------------------------------------------------------
+info "浏览器打开（OAuth 登录依赖这条链路）"
+# ---------------------------------------------------------------------------
+# OAuth 在这里就是「打开厂商登录页，再手动贴回 token」。若这一步失效，
+# 点登录毫无反应 —— 所以必须单独断言，而不是等用户去发现。
+SSE_FILE="$WORKDIR/sse.txt"
+: > "$SSE_FILE"
+( curl -sS --max-time 12 -N "http://127.0.0.1:${PORT}/__ipc/events" > "$SSE_FILE" 2>/dev/null & )
+sleep 2
+docker exec "$CONTAINER" node -e '
+const s = require("/app/shim/electron-shim.js");
+s.shell.openExternal("https://chat.deepseek.com");
+' >/dev/null 2>&1
+sleep 3
+if grep -q 'chat.deepseek.com' "$SSE_FILE" 2>/dev/null; then
+  pass "shell.openExternal 会推送到界面（可用于打开登录页）"
+else
+  fail "shell.openExternal 未到达事件流：$(head -c 200 "$SSE_FILE" 2>/dev/null)"
+fi
+
+# 没有订阅者时应当排队，而不是丢弃。
+QUEUED_OUT="$(docker exec "$CONTAINER" node -e '
+const s = require("/app/shim/electron-shim.js");
+// 没有客户端连接时调用：应被排队。
+s.shell.openExternal("https://queued.example/probe")
+  .then(() => console.log("queued"))
+  .catch((e) => console.log("error:" + e.message));
+' 2>&1)"
+if grep -q 'queued' <<<"$QUEUED_OUT"; then
+  pass "无订阅者时的打开请求会被保留（不静默丢弃）"
+else
+  fail "排队逻辑异常: $QUEUED_OUT"
+fi
+
+# ---------------------------------------------------------------------------
 info "同一端口上的两个 API"
 # ---------------------------------------------------------------------------
 HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health" || echo '')"
@@ -173,7 +213,7 @@ grep -q '"object":"list"' <<<"$MODELS" \
   && pass "/v1/models 经同一端口返回 OpenAI 格式" || fail "/v1/models 异常: $MODELS"
 
 # ---------------------------------------------------------------------------
-info "管理 API：/management 别名与 /v0/management 等价"
+info "管理 API：/management 与 /v0/management 等价"
 # ---------------------------------------------------------------------------
 MGMT_ALIAS="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:${PORT}/management/accounts" || echo '')"
 MGMT_UPSTREAM="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
@@ -186,7 +226,6 @@ UPSTREAM_CODE="$(tail -1 <<<"$MGMT_UPSTREAM")"
   && pass "两个前缀状态码一致（$ALIAS_CODE）" \
   || fail "前缀行为不一致: /management=$ALIAS_CODE /v0/management=$UPSTREAM_CODE"
 
-# 响应体也应一致（除可能存在的时间戳外，先比对键名）
 ALIAS_KEYS="$(head -n -1 <<<"$MGMT_ALIAS" | grep -oE '"[a-zA-Z]+":' | sort -u | tr -d '\n')"
 UPSTREAM_KEYS="$(head -n -1 <<<"$MGMT_UPSTREAM" | grep -oE '"[a-zA-Z]+":' | sort -u | tr -d '\n')"
 [ "$ALIAS_KEYS" = "$UPSTREAM_KEYS" ] \

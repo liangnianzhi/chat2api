@@ -140,13 +140,13 @@ fi
 
 INDEX="$(curl -fsS "http://127.0.0.1:${PORT}/" || echo '')"
 grep -q '/__preload.js' <<<"$INDEX" \
-  && pass "页面已注入 preload 喾" || fail "页面缺少 /__preload.js"
+  && pass "页面已注入 preload 桥" || fail "页面缺少 /__preload.js"
 grep -q 'id="acctProvider"' <<<"$INDEX" \
   && fail "仍在提供内置降级控制台" || pass "提供的是上游界面"
 
 PRELOAD="$(curl -fsS "http://127.0.0.1:${PORT}/__preload.js" || echo '')"
 grep -q 'contextBridge' <<<"$PRELOAD" \
-  && pass "preload 喾已就绪（含 contextBridge）" || fail "preload 内容异常"
+  && pass "preload 桥已就绪（含 contextBridge）" || fail "preload 内容异常"
 
 ASSET="$(grep -oE '(src|href)="[^"]*/assets/[^"]+"' <<<"$INDEX" | head -1 | sed 's/.*="//;s/"$//')"
 ASSET="${ASSET#./}"
@@ -211,15 +211,14 @@ grep -q 'smoke-token-value' <<<"$LIST" \
   && fail "列表泄露了明文凭证" || pass "列表未泄露明文凭证（已掩码）"
 
 # ---------------------------------------------------------------------------
-info "账户写入与读取（通过 IPC 桥，即界面走的路径）"
+info "IPC 桥能派发真实 channel（界面走的就是这条路）"
 # ---------------------------------------------------------------------------
 IPC_ACC="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
   -H 'Content-Type: application/json' \
-  -d '{"channel":"accounts:get-all","args":[false]}' || echo '')"
+  -d '{"channel":"accounts:getAll","args":[false]}' || echo '')"
 if grep -q '"ok":true' <<<"$IPC_ACC"; then
-  pass "IPC 桥能派发真实 channel（accounts:get-all）"
+  pass "IPC 桥能派发真实 channel（accounts:getAll）"
 else
-  # Channel naming is upstream's; if it changed, fall back to the default path.
   IPC_ANY="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
     -H 'Content-Type: application/json' \
     -d '{"channel":"config:get","args":[]}' || echo '')"

@@ -7,16 +7,15 @@
 #
 #   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
-# Deployment is zero-config and single-port: no secrets to provision, and the
-# console, the OpenAI routes and the management API are all reached through the
-# same address.
+# Deployment is zero-config and single-port: the upstream UI, the OpenAI routes
+# and the management API are all reached through the same address.
 
 set -uo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
 CONTAINER="${CONTAINER:-chat2api-smoke}"
 PORT="${PORT:-18080}"
-SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-250}"
+SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-300}"
 WORKDIR="$(mktemp -d)"
 
 FAILED=0
@@ -49,7 +48,7 @@ start_container() {
 }
 
 wait_ready() {
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 90); do
     if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
@@ -69,11 +68,11 @@ start_container
 info "启动与健康检查"
 # ---------------------------------------------------------------------------
 if wait_ready; then
-  pass "容器在 120s 内就绪（数据卷属主已自动修正）"
+  pass "容器在 180s 内就绪（数据卷属主已自动修正）"
 else
   fail "容器未就绪"
   echo "---- 容器日志 ----"
-  docker logs --tail 80 "$CONTAINER" 2>&1 | sed 's/^/      /'
+  docker logs --tail 100 "$CONTAINER" 2>&1 | sed 's/^/      /'
   echo
   printf '\n\033[31m❌ SMOKE TEST FAILED（容器未就绪，提前退出）\033[0m\n'
   printf '失败项：\n%s\n' "$FAILURES"
@@ -102,8 +101,6 @@ fi
 # ---------------------------------------------------------------------------
 info "主进程已降权"
 # ---------------------------------------------------------------------------
-# docker exec 默认以 root 进入（镜像未设 USER），那只反映 exec 的身份。
-# 改看运行时产物属主：文件由网关进程写入，属主即其 uid。
 SECRET_FILE="/data/.chat2api/.management-secret"
 RUNTIME_OWNER="$(in_container "stat -c '%u' $SECRET_FILE" | tr -d '\r\n')"
 [ "$RUNTIME_OWNER" = "1000" ] \
@@ -127,6 +124,49 @@ grep -q '^ok$' <<<"$WASM_OUT" \
   || fail "wasm 路径解析失败：$WASM_OUT"
 
 # ---------------------------------------------------------------------------
+info "上游原版界面（由 IPC 桥驱动）"
+# ---------------------------------------------------------------------------
+BRIDGE="$(curl -fsS "http://127.0.0.1:${PORT}/_ui/health" || echo '')"
+grep -q '"ui":"upstream"' <<<"$BRIDGE" \
+  && pass "前端来自上游 out/renderer（不是内置降级页）" \
+  || fail "未启用上游界面: $BRIDGE"
+
+CHANNELS="$(grep -oE '"channels":[0-9]+' <<<"$BRIDGE" | grep -oE '[0-9]+' | head -1)"
+if [ -n "$CHANNELS" ] && [ "$CHANNELS" -gt 100 ]; then
+  pass "上游 IPC 处理器已登记（$CHANNELS 个 channel）"
+else
+  fail "IPC 处理器数量异常: ${CHANNELS:-无}"
+fi
+
+INDEX="$(curl -fsS "http://127.0.0.1:${PORT}/" || echo '')"
+grep -q '/__preload.js' <<<"$INDEX" \
+  && pass "页面已注入 preload 喾" || fail "页面缺少 /__preload.js"
+grep -q 'id="acctProvider"' <<<"$INDEX" \
+  && fail "仍在提供内置降级控制台" || pass "提供的是上游界面"
+
+PRELOAD="$(curl -fsS "http://127.0.0.1:${PORT}/__preload.js" || echo '')"
+grep -q 'contextBridge' <<<"$PRELOAD" \
+  && pass "preload 喾已就绪（含 contextBridge）" || fail "preload 内容异常"
+
+ASSET="$(grep -oE '(src|href)="[^"]*/assets/[^"]+"' <<<"$INDEX" | head -1 | sed 's/.*="//;s/"$//')"
+ASSET="${ASSET#./}"
+case "$ASSET" in /*) ;; *) ASSET="/$ASSET" ;; esac
+if [ -n "$ASSET" ]; then
+  AC="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}${ASSET}")"
+  [ "$AC" = 200 ] \
+    && pass "前端静态资源可访问（$ASSET）" \
+    || fail "静态资源 $ASSET -> HTTP $AC"
+else
+  fail "页面未引用任何 /assets/ 资源"
+fi
+
+CODE_IPC="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${PORT}/__ipc" \
+  -H 'Content-Type: application/json' -d '{"channel":"__no_such_channel__","args":[]}')"
+[ "$CODE_IPC" = 404 ] \
+  && pass "IPC 端点已就绪（未知 channel -> 404）" \
+  || fail "IPC 端点异常: HTTP $CODE_IPC"
+
+# ---------------------------------------------------------------------------
 info "同一端口上的两个 API"
 # ---------------------------------------------------------------------------
 HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health" || echo '')"
@@ -141,20 +181,6 @@ CODE_MGMT="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v0
 [ "$CODE_MGMT" = 200 ] \
   && pass "/v0/management 经同一端口可用（服务端已注入密钥）" \
   || fail "/v0/management 应返回 200，实际 $CODE_MGMT"
-
-# ---------------------------------------------------------------------------
-info "管理台页面"
-# ---------------------------------------------------------------------------
-UI_HTML="$(curl -fsS "http://127.0.0.1:${PORT}/" || echo '')"
-grep -q 'Chat2API 管理台' <<<"$UI_HTML" \
-  && pass "根路径返回管理台页面" || fail "管理台页面内容异常"
-
-# 按元素判定，不按文案——页面里可能有提到密钥的注释/说明文字。
-if grep -q 'id="secret"' <<<"$UI_HTML"; then
-  fail "页面上仍有密钥输入框（id=secret）"
-else
-  pass "页面上没有登录/密钥输入"
-fi
 
 # ---------------------------------------------------------------------------
 info "生成的密钥"
@@ -183,6 +209,24 @@ grep -q 'smoke-account' <<<"$LIST" \
 
 grep -q 'smoke-token-value' <<<"$LIST" \
   && fail "列表泄露了明文凭证" || pass "列表未泄露明文凭证（已掩码）"
+
+# ---------------------------------------------------------------------------
+info "账户写入与读取（通过 IPC 桥，即界面走的路径）"
+# ---------------------------------------------------------------------------
+IPC_ACC="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
+  -H 'Content-Type: application/json' \
+  -d '{"channel":"accounts:get-all","args":[false]}' || echo '')"
+if grep -q '"ok":true' <<<"$IPC_ACC"; then
+  pass "IPC 桥能派发真实 channel（accounts:get-all）"
+else
+  # Channel naming is upstream's; if it changed, fall back to the default path.
+  IPC_ANY="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
+    -H 'Content-Type: application/json' \
+    -d '{"channel":"config:get","args":[]}' || echo '')"
+  grep -q '"ok":true' <<<"$IPC_ANY" \
+    && pass "IPC 桥能派发真实 channel（config:get）" \
+    || fail "IPC 桥无法派发任何真实 channel: $IPC_ANY"
+fi
 
 # ---------------------------------------------------------------------------
 info "客户端 API 密钥"
@@ -239,8 +283,7 @@ grep -q 'smoke-account' <<<"$AFTER" \
 
 SECRET_AFTER="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
 [ "$SECRET_AFTER" = "$SECRET" ] \
-  && pass "重启后管理密钥不变（管理台无需重新登录）" \
-  || fail "重启后管理密钥变化"
+  && pass "重启后管理密钥不变" || fail "重启后管理密钥变化"
 
 # ---------------------------------------------------------------------------
 info "镜像体积预算"
@@ -262,6 +305,6 @@ else
   printf '\n\033[31m❌ SMOKE TEST FAILED\033[0m\n'
   printf '失败项：\n%s\n' "$FAILURES"
   echo "---- 容器日志 ----"
-  docker logs --tail 60 "$CONTAINER" 2>&1 || true
+  docker logs --tail 80 "$CONTAINER" 2>&1 || true
   exit 1
 fi

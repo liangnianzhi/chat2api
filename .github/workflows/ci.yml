@@ -17,7 +17,7 @@ on:
     - cron: '17 3 * * 1'
 
 permissions:
-  contents: read
+  contents: write   # 仅用于失败时提交 smoke-failure.log
   packages: write
 
 env:
@@ -46,7 +46,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          # Only fail on errors, not style nits.
           shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
 
   # ---------------------------------------------------------------------------
@@ -114,8 +113,29 @@ jobs:
       # The deep functional suite: console, account CRUD, credential encryption,
       # persistence across restarts, proxy whitelist, image size budget.
       - name: Run container smoke tests
+        id: smoke
         run: |
-          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh
+          set -o pipefail
+          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
+
+      # Publish the smoke output so the failing assertion is readable without
+      # authenticated access to the job log. Temporary until the suite is green.
+      - name: Publish smoke output on failure
+        if: failure()
+        run: |
+          if [ ! -f /tmp/smoke.log ]; then echo 'no smoke log'; exit 0; fi
+          {
+            echo "# Smoke test output (run ${{ github.run_id }}, commit ${{ github.sha }})"
+            echo
+            echo '```'
+            cat /tmp/smoke.log
+            echo '```'
+          } > smoke-failure.log
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f smoke-failure.log
+          git commit -m 'ci: capture smoke test failure output [skip ci]' || echo 'nothing to commit'
+          git push || echo 'push failed'
 
       - name: Container logs on failure
         if: failure()
@@ -144,7 +164,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # 只维护单一的滚动 latest 标签。
           tags: |
             type=raw,value=latest
 

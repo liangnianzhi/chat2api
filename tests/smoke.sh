@@ -151,8 +151,9 @@ UI_HTML="$(curl -fsS "http://127.0.0.1:${UI_PORT}/" || echo '')"
 grep -q 'Chat2API 管理台' <<<"$UI_HTML" \
   && pass "管理台页面可访问" || fail "管理台页面内容异常"
 
-if grep -q '管理密钥' <<<"$UI_HTML"; then
-  fail "页面上仍有「管理密钥」输入框（已应移除）"
+# 按元素判定，不按文案——页面里可能有提到密钥的注释/说明文字。
+if grep -q 'id="secret"' <<<"$UI_HTML"; then
+  fail "页面上仍有密钥输入框（id=secret）"
 else
   pass "页面上没有登录/密钥输入"
 fi

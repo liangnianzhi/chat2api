@@ -13,14 +13,13 @@
  *
  * IN-APP LOGIN
  * ------------
- * Upstream's "web login" creates a BrowserWindow, loads the provider site, and
- * harvests the token from that window's localStorage/cookies. There is no window
- * in a container, so the mechanism cannot be reproduced at all.
+ * Upstream's "web login" creates a BrowserWindow, loads the provider site and
+ * harvests the token from that window's localStorage/cookies. A container has no
+ * window, so the mechanism cannot be reproduced.
  *
- * Rather than let it fail (which is what made the button spin and error), the
- * oauth:startInAppLogin channel is answered here with a result that sends the UI
- * to a page the container *can* serve: webui/login.html, which tells the user
- * which field to copy for their provider and stores what they paste back.
+ * Instead of letting it fail - which made the button spin and then show an error
+ * - the oauth:startInAppLogin channel is answered here with a result that sends
+ * the UI to a page the container can serve: webui/login.html.
  */
 
 'use strict'
@@ -36,9 +35,6 @@ const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
 
 /* ------------------------------------------------------------------ *
  * process.resourcesPath
- *
- * Electron defines this; plain Node does not. The compiled bundle uses it to
- * locate the sha3 wasm it needs for DeepSeek/GLM request signing.
  * ------------------------------------------------------------------ */
 const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR || path.join(__dirname, '..', 'upstream')
 if (typeof process.resourcesPath !== 'string') {
@@ -116,16 +112,6 @@ const safeStorage = {
 
 /* ------------------------------------------------------------------ *
  * Single port capture
- *
- * Upstream calls app.listen(), which ends at http.Server.prototype.listen. That
- * bind is intercepted: the server's request listeners are replayed as the
- * handler, and a stand-in handle is returned without opening a socket.
- *
- * Patching Koa's prototype does not work - electron-vite inlines dependencies,
- * so upstream's Koa is a private copy.
- *
- * The caller's callback IS invoked, because upstream does its proxyStatusManager
- * bookkeeping there.
  * ------------------------------------------------------------------ */
 const INTERCEPT_PORTS = new Set(
   (process.env.CHAT2API_INTERCEPT_PORTS || '8082,18090,18080')
@@ -432,10 +418,6 @@ const dialog = {
 
 /* ------------------------------------------------------------------ *
  * Tray / Menu / nativeImage
- *
- * Inert rather than throwing: registerIpcHandlers calls
- * TrayManager.getInstance().updateProxyStatus() from the proxy start/stop
- * handlers.
  * ------------------------------------------------------------------ */
 const nativeImage = {
   createFromPath: () => ({
@@ -476,13 +458,13 @@ const powerMonitor = { on: () => {}, once: () => {}, off: () => {} }
 /* ------------------------------------------------------------------ *
  * In-app login override
  *
- * Registered into this map before upstream claims the channel (upstream's
- * registerIpcHandlers runs later and would otherwise win). The front server
- * writes the handler into __ipcHandlers at startup - see "installLoginOverride".
- *
- * Return value: an OAuthResult the caller already knows how to read. `error` is
- * shown verbatim by AddAccountDialog, so it carries the instruction.
+ * Registered into the handler map, and re-registered if upstream later claims
+ * the channel. `error` is rendered verbatim by AddAccountDialog, so it carries
+ * the instruction. A machine-readable `code` is included so tooling (and the
+ * smoke test) can assert on something other than translated text.
  * ------------------------------------------------------------------ */
+const LOGIN_CHANNEL = 'oauth:startInAppLogin'
+
 function loginPageUrl(providerType, providerId) {
   const base = process.env.CHAT2API_PUBLIC_BASE_URL
     || `http://${process.env.CHAT2API_PUBLIC_HOST || 'localhost'}:${process.env.CHAT2API_PORT || '8082'}`
@@ -490,37 +472,33 @@ function loginPageUrl(providerType, providerId) {
   return `${base}/__login?${params.toString()}`
 }
 
-function installLoginOverride() {
-  const CHANNEL = 'oauth:startInAppLogin'
-  const handler = async (_event, data) => {
-    const providerType = (data && data.providerType) || (data && data.providerId) || ''
-    const providerId = (data && data.providerId) || providerType
+async function inAppLoginHandler(_event, data) {
+  const providerType = (data && data.providerType) || (data && data.providerId) || ''
+  const providerId = (data && data.providerId) || providerType
+  const url = loginPageUrl(providerType, providerId)
 
-    const url = loginPageUrl(providerType, providerId)
-    console.log(`[shim] in-app login requested for ${providerType}; directing to ${url}`)
+  console.log(`[shim] in-app login requested for ${providerType}; directing to ${url}`)
+  emitEvent('__c2a:openExternal', [url])
 
-    // Tell the page to open the login tab, then answer the caller.
-    emitEvent('__c2a:openExternal', [url])
-
-    return {
-      success: false,
-      providerId,
-      providerType,
-      error: '网页登录已改为「登录并粘贴凭证」：请在新打开的页面里完成登录后粘贴 token。',
-    }
+  return {
+    success: false,
+    code: 'login_page_opened',
+    loginPage: url,
+    providerId,
+    providerType,
+    error: '网页登录已改为「登录并粘贴凭证」：已打开登录页，请在其中完成登录后粘贴 token。',
   }
+}
 
-  // Override whatever upstream registers for this channel, now and later.
+function installLoginOverride() {
   const originalSet = ipcHandlers.set.bind(ipcHandlers)
   ipcHandlers.set = (channel, fn) => {
-    if (channel === CHANNEL) {
-      return originalSet(channel, handler)
+    if (channel === LOGIN_CHANNEL) {
+      return originalSet(channel, inAppLoginHandler)
     }
     return originalSet(channel, fn)
   }
-  originalSet(CHANNEL, handler)
-
-  return { CHANNEL, handler }
+  originalSet(LOGIN_CHANNEL, inAppLoginHandler)
 }
 
 installLoginOverride()

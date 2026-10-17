@@ -3,36 +3,34 @@
  *
  * WHAT IT SERVES
  * --------------
- * One address, the way the desktop app worked:
+ * One address, one HTTP server, the way the desktop app worked:
  *
  *   GET /                -> the upstream renderer (the real Chat2API UI)
  *   /assets/*, static    -> files from out/renderer
  *   POST /__ipc          -> dispatch into upstream's ipcMain.handle registry
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
  *   GET  /__preload.js   -> the browser bridge + upstream's preload bundle
- *   /management/*        -> rewritten to /v0/management/* and proxied
- *   /v1/*, /v0/*, /health, /stats -> proxied to the gateway
+ *   /management/*        -> rewritten to /v0/management/*, then to the proxy
+ *   everything else      -> upstream's Koa app (the OpenAI-compatible API)
  *
- * THE SINGLE PORT
- * ---------------
- * 8082 is the only port that exists as far as the host is concerned. Inside the
- * container the gateway listens on loopback at CHAT2API_INTERNAL_PORT, because
- * upstream's ProxyServer takes an explicit listen port and cannot serve from a
- * request handler. That address is an implementation detail: it is never
- * published, and everything the operator uses - UI, API, management - arrives on
- * 8082.
- *
- * WHY THE REAL RENDERER
- * ---------------------
- * Upstream's UI and all of its logic already exist. Rather than reimplement the
- * pages, the built renderer is served as-is and its IPC calls are bridged to the
- * very same handlers Electron would have called.
- *
- * WHY IN-PROCESS
+ * NO SECOND PORT
  * --------------
- * The handler registry lives in this process (the shim records handlers as
- * upstream registers them). A separate process could not reach it, so
- * gateway.js requires this module instead of spawning it.
+ * Upstream's ProxyServer wants its own listen port. Rather than run a second
+ * server on loopback and forward to it, this module calls the Koa app's
+ * `callback()` directly - a supported integration that produces a plain
+ * (req, res) handler. So the container really does have one server on one port.
+ *
+ * The loopback path is kept as a fallback: if the callback cannot be obtained
+ * (upstream renames things, or the instance is not published), requests are
+ * proxied to the gateway's own port instead, so the API degrades rather than
+ * breaking.
+ *
+ * MANAGEMENT AUTH
+ * ---------------
+ * Upstream's management middleware expects a secret. Requests now reach the Koa
+ * app without that middleware having attached anything, so this server sets the
+ * Authorization header for management paths before handing off. Direct API
+ * clients are unaffected: /v1 passes through untouched.
  */
 
 'use strict'
@@ -50,7 +48,7 @@ const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'pr
 // The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
-// The gateway's own listen address: inside the container, never published.
+// Fallback only: used if the in-process Koa callback is unavailable.
 const GATEWAY = {
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
@@ -77,6 +75,30 @@ function handlerCount() {
 }
 function bridgeReady() {
   return handlerCount() > 0
+}
+
+/**
+ * The upstream Koa request handler, resolved lazily.
+ *
+ * Set by shim/headless-entry.ts once the ProxyServer is constructed. Resolving
+ * lazily matters because the front server starts before the proxy finishes
+ * binding, and early requests should still get a sensible answer.
+ */
+function proxyHandler() {
+  const server = shim && shim.__proxyServer
+  if (!server) return null
+  try {
+    const app = server.app
+    if (app && typeof app.callback === 'function') {
+      // Cache per instance: callback() builds a fresh handler each call.
+      if (server.__frontCallback) return server.__frontCallback
+      server.__frontCallback = app.callback()
+      return server.__frontCallback
+    }
+  } catch (err) {
+    console.warn('[front] could not obtain the Koa callback:', err.message)
+  }
+  return null
 }
 
 const streamClients = new Set()
@@ -131,7 +153,6 @@ function readSecret() {
  *
  * <base href="/"> matters because vite emits relative asset URLs (./assets/...);
  * on a nested SPA route those would resolve against the route and 404.
- * The preload script must run before the app bundle, hence the position.
  */
 function injectConsoleHtml(html) {
   let out = html
@@ -148,7 +169,6 @@ function serveIndex(res) {
   const upstreamIndex = path.join(RENDERER_DIR, 'index.html')
   fs.readFile(upstreamIndex, (err, buf) => {
     if (err) {
-      // Deliberately loud: there is no fallback UI to hide behind.
       console.error('[front] cannot read the upstream UI at', upstreamIndex, '-', err.message)
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
       res.end(
@@ -179,8 +199,6 @@ function servePreload(res) {
     return
   }
 
-  // electron-vite emits the preload as CommonJS. If that ever changes this will
-  // fail loudly in the browser console rather than silently doing nothing.
   if (/^\s*(import|export)\s/m.test(bundle)) {
     console.error('[front] preload bundle looks like ESM; the CJS wrapper will not work')
   }
@@ -239,8 +257,6 @@ async function handleIpc(req, res) {
   }
 
   try {
-    // Upstream handlers take (event, ...args). The event is only used for reply
-    // plumbing, which the HTTP round-trip replaces.
     const result = await handler({ sender: null, senderFrame: null }, ...args)
     send(200, { ok: true, result: result === undefined ? null : result })
   } catch (err) {
@@ -263,8 +279,6 @@ function handleEvents(req, res) {
   }
   streamClients.add(client)
 
-  // Opens requested before anyone was listening (the OAuth case) are replayed
-  // now that there is somewhere to send them.
   if (shim && typeof shim.__replayPendingOpens === 'function') {
     shim.__replayPendingOpens()
   }
@@ -308,16 +322,19 @@ function serveStatic(res, urlPath) {
 }
 
 /* ------------------------------------------------------------------ *
- * Gateway proxy
+ * Handing a request to upstream
  * ------------------------------------------------------------------ */
-function proxy(req, res, urlPath) {
-  const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
+function isManagementPath(urlPath) {
+  return urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')
+    || urlPath.startsWith(UPSTREAM_MGMT)
+}
 
-  if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')
-      || urlPath.startsWith(UPSTREAM_MGMT)) {
+/** Attach the management credential and rewrite the alias, in place. */
+function prepareForGateway(req, urlPath) {
+  if (isManagementPath(urlPath)) {
     const secret = readSecret()
     if (secret) {
-      headers.authorization = `Bearer ${secret}`
+      req.headers.authorization = `Bearer ${secret}`
     } else {
       console.warn('[front] management secret unavailable at', SECRET_FILE)
     }
@@ -325,17 +342,19 @@ function proxy(req, res, urlPath) {
 
   // /management/x -> /v0/management/x. Upstream matches the full prefix in
   // several middlewares, so the rewrite happens here rather than at the source.
-  let targetPath = req.url
-  if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')) {
-    targetPath = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
+  if (isManagementPath(urlPath) && !urlPath.startsWith(UPSTREAM_MGMT)) {
+    req.url = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
   }
+}
 
+function proxyToGateway(req, res) {
+  const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
   const upstream = http.request(
     {
       host: GATEWAY.host,
       port: GATEWAY.port,
       method: req.method,
-      path: targetPath,
+      path: req.url,
       headers,
     },
     (upRes) => {
@@ -343,7 +362,6 @@ function proxy(req, res, urlPath) {
       upRes.pipe(res)
     }
   )
-
   upstream.on('error', (err) => {
     console.error('[front] upstream error:', err.message)
     if (res.headersSent) { res.end(); return }
@@ -355,8 +373,30 @@ function proxy(req, res, urlPath) {
       },
     }))
   })
-
   req.pipe(upstream)
+}
+
+/**
+ * Hand the request to upstream's Koa app in-process.
+ *
+ * Falls back to the loopback proxy when the callback is not available, which
+ * covers the window before the proxy starts and any surprise about the
+ * instance shape. Either way the response is upstream's own.
+ */
+function dispatch(req, res, urlPath) {
+  prepareForGateway(req, urlPath)
+
+  const handler = proxyHandler()
+  if (handler) {
+    try {
+      handler(req, res)
+      return
+    } catch (err) {
+      console.error('[front] in-process dispatch failed, falling back:', err && err.message)
+      if (res.headersSent) { res.end(); return }
+    }
+  }
+  proxyToGateway(req, res)
 }
 
 /* ------------------------------------------------------------------ *
@@ -372,7 +412,7 @@ function createServer() {
 
     if (urlPath === '/health' || urlPath === '/stats'
         || API_PREFIXES.some((p) => urlPath.startsWith(p))) {
-      proxy(req, res, urlPath)
+      dispatch(req, res, urlPath)
       return
     }
 
@@ -385,19 +425,18 @@ function createServer() {
       return
     }
 
-    proxy(req, res, urlPath)
+    dispatch(req, res, urlPath)
   })
 }
 
 function start() {
   const server = createServer()
   server.listen(PUBLIC_PORT, PUBLIC_HOST, () => {
-    console.log(`[front] Chat2API ready on http://${PUBLIC_HOST}:${PUBLIC_PORT} (the only published port)`)
+    console.log(`[front] Chat2API ready on http://${PUBLIC_HOST}:${PUBLIC_PORT} (the only port)`)
     if (bridgeReady()) {
       console.log(`[front] UI: upstream renderer, IPC bridge active (${handlerCount()} channels)`)
     } else {
       console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
-      console.warn('[front] The API on /v1 is unaffected. See the log above for the cause.')
     }
   })
 

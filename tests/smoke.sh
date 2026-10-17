@@ -79,7 +79,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-info "只有一个对外端口"
+info "只有一个对外端口，且 API 在进程内处理"
 # ---------------------------------------------------------------------------
 LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
 grep -q 'electron shim active' <<<"$LOGS" \
@@ -94,6 +94,26 @@ else
   fail "发布端口异常: $PORTS"
 fi
 
+# 合并的核心断言：Koa handler 被截获，且没有回退到回环端口。
+grep -q 'captured the Koa request handler' <<<"$LOGS" \
+  && pass "已截获上游 Koa 请求处理器" || fail "未截获 Koa 处理器（说明回退到了回环端口）"
+grep -q 'API: served in-process, no second port' <<<"$LOGS" \
+  && pass "API 由同一端口进程内处理" || fail "API 未走进程内处理"
+
+# 容器内不应有第二个监听端口（除 8082 外）。
+LISTENERS="$(in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -cE ':(8082|18090) ' || true)"
+if ! in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -q ':18090 '; then
+  pass "容器内没有 18090 监听（回环端口已消除）"
+else
+  fail "容器内仍有 18090 在监听"
+fi
+
+# 上游必须仍然认为自己「在运行」——否则界面会显示已停止。
+PROXY_STATE="$(curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -oE '"status":"[a-z]+"' | head -1)"
+[ "$PROXY_STATE" = '"status":"running"' ] \
+  && pass "上游代理自报 running（listen 回调已触发）" \
+  || fail "上游代理状态异常: $PROXY_STATE"
+
 if docker run --rm --entrypoint sh "$IMAGE" \
      -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
   fail "镜像里存在 Xvfb/Chromium/electron 可执行文件"
@@ -104,7 +124,6 @@ fi
 # ---------------------------------------------------------------------------
 info "时区默认为 Asia/Shanghai"
 # ---------------------------------------------------------------------------
-# 静默回退到 UTC 只会在日志时间戳上发现，所以直接问容器。
 TZ_ENV="$(in_container 'printf %s "$TZ"' | tr -d '\r\n')"
 [ "$TZ_ENV" = "Asia/Shanghai" ] \
   && pass "TZ=$TZ_ENV" || fail "TZ=$TZ_ENV，预期 Asia/Shanghai"
@@ -113,7 +132,6 @@ TZ_FILE="$(in_container 'readlink /etc/localtime' | tr -d '\r\n')"
 [[ "$TZ_FILE" == *"Shanghai"* ]] \
   && pass "/etc/localtime -> $TZ_FILE" || fail "/etc/localtime 未指向上海：$TZ_FILE"
 
-# 偏移应为 +0800
 TZ_OFFSET="$(in_container 'date +%z' | tr -d '\r\n')"
 [ "$TZ_OFFSET" = "+0800" ] \
   && pass "date +%z = $TZ_OFFSET" || fail "时区偏移为 $TZ_OFFSET，预期 +0800"
@@ -272,6 +290,15 @@ grep -q 'smoke-account' <<<"$LIST" \
 
 grep -q 'smoke-token-value' <<<"$LIST" \
   && fail "列表泄露了明文凭证" || pass "列表未泄露明文凭证（已掩码）"
+
+# ---------------------------------------------------------------------------
+info "客户端 API 密钥"
+# ---------------------------------------------------------------------------
+KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/management/api-keys" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-client"}' || echo '')"
+grep -q 'sk-mgmt-' <<<"$KEYRESP" \
+  && pass "生成客户端 API 密钥" || fail "生成密钥失败: $KEYRESP"
 
 # ---------------------------------------------------------------------------
 info "凭证加密（AES-256-GCM）"

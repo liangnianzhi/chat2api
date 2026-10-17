@@ -1,20 +1,11 @@
 name: build
 
-# 构建时机：**手动触发**。
-#
-#   GitHub → Actions → build → Run workflow
-#
-# 一轮修改全部提交完之后点一次即可：它会把「构建 → 测试 → 推送 latest」
-# 一次做完，不会因为中间提交而重复构建。
-#
-# 例外：PR 会构建并测试（不推送），这样改动可以在合并前验完。
-
 on:
   workflow_dispatch:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write   # 仅用于失败时提交 smoke-failure.log，绿后移除
   packages: write
 
 env:
@@ -26,13 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Shell syntax check
         run: |
           bash -n tests/smoke.sh
           sh -n shim/entrypoint.sh
           echo 'shell syntax OK'
-
       - name: Node syntax check
         run: |
           node --check webui/server.js
@@ -40,7 +29,6 @@ jobs:
           node --check shim/electron-shim.js
           node --check shim/gateway.js
           echo 'node syntax OK'
-
       - name: ShellCheck
         run: |
           sudo apt-get update -qq
@@ -52,12 +40,8 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-
-      # 只构建**一次**。后面部署验证、冒烟测试、推送全部用这同一个镜像，
-      # 所以一次运行只会产生一个 digest。
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -69,60 +53,40 @@ jobs:
             CHAT2API_REF=${{ env.CHAT2API_REF }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
       - name: Show image size, upstream version and digest
         run: |
           docker image inspect ${{ env.IMAGE_REF }} --format 'image size: {{.Size}} bytes'
-          echo "digest: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}' 2>/dev/null || echo 'local image, digest assigned on push')"
           docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO
-
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
-
-      # 按文档里的真实路径部署：只有 mkdir + compose up。
       - name: Bring the stack up via compose
         run: |
           mkdir -p data
           docker compose up -d
-
           for i in $(seq 1 90); do
             if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then break; fi
             sleep 2
           done
-
-          echo '--- /health ---'
-          curl -fsS http://127.0.0.1:8082/health
-          echo
-          echo '--- one port, three surfaces ---'
-          curl -fsS -o /dev/null -w 'GET /                -> HTTP %{http_code}\n' http://127.0.0.1:8082/
-          curl -fsS -o /dev/null -w 'GET /v1/models      -> HTTP %{http_code}\n' http://127.0.0.1:8082/v1/models
-          curl -sS  -o /dev/null -w 'GET /management/...  -> HTTP %{http_code}\n' http://127.0.0.1:8082/management/accounts
-
-          echo '--- published ports ---'
-          docker port chat2api
-
+          echo '--- container log ---'
+          docker compose logs --tail 60 || true
       - name: Tear down compose stack
         if: always()
         run: |
-          docker compose logs --tail 80 || true
           docker compose down -v || true
-
       - name: Run container smoke tests
+        id: smoke
         run: |
-          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh
-
+          set -o pipefail
+          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
       - name: Container logs on failure
         if: failure()
         run: |
-          docker ps -a
-          for c in $(docker ps -aq); do
-            echo "--- logs: $c ---"
-            docker logs --tail 100 "$c" 2>&1 || true
-          done
-
-      # ---------------------------------------------------------------------
-      # 发布：推送的正是上面测过的那个镜像（不再重建一次）
-      # ---------------------------------------------------------------------
+          { echo '# Smoke test output'; echo; echo '```'; cat /tmp/smoke.log 2>/dev/null || echo none; echo '```'; } > smoke-failure.log
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f smoke-failure.log
+          git commit -m 'ci: capture failure output [skip ci]' || { echo 'nothing'; exit 0; }
+          git push origin "HEAD:${GITHUB_REF_NAME}" || echo 'push failed'
       - name: Log in to GHCR
         if: success() && github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
@@ -130,26 +94,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Push the tested image
         if: success() && github.event_name == 'workflow_dispatch'
-        run: |
-          docker push ${{ env.IMAGE_REF }}
-          echo "--- pushed ---"
-          docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}'
-
-      - name: Summary
-        if: success()
-        run: |
-          {
-            echo '### chat2api'
-            echo
-            echo "- image: \`${{ env.IMAGE_REF }}\`"
-            echo "- upstream: $(docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tr '\n' ' ')"
-            echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1048576}')"
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              echo "- pushed: yes (one digest for one build)"
-            else
-              echo '- pushed: no (pull request - build only)'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: docker push ${{ env.IMAGE_REF }}

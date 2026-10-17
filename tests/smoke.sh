@@ -1,9 +1,114 @@
-# 强制降权运行
+#!/usr/bin/env bash
+#
+# Smoke test for the chat2api container.
+#
+# Runs against a freshly created container and reports PASS/FAIL per check.
+# Used by .github/workflows/ci.yml, and runnable locally:
+#
+#   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
+#
+# No secrets are provisioned: deployment is zero-config, so the suite asserts
+# that the console works with no credentials while the gateway API stays
+# protected behind the secret the container generated for itself.
+
+set -uo pipefail
+
+IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
+CONTAINER="${CONTAINER:-chat2api-smoke}"
+API_PORT="${API_PORT:-18080}"
+UI_PORT="${UI_PORT:-18081}"
+SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-250}"
+WORKDIR="$(mktemp -d)"
+
+FAILED=0
+FAILURES=""
+pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
+fail() {
+  printf '  \033[31mFAIL\033[0m  %s\n' "$*"
+  FAILED=1
+  FAILURES="${FAILURES}${FAILURES:+
+}  - $*"
+}
+info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+cleanup() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # The container writes into the bind mount as uid 1000, which the runner user
+  # may not be able to remove directly.
+  if command -v sudo >/dev/null 2>&1; then
+    sudo rm -rf "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR" 2>/dev/null || true
+  else
+    rm -rf "$WORKDIR" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+start_container() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$CONTAINER" \
+    -p "127.0.0.1:${API_PORT}:8080" \
+    -p "127.0.0.1:${UI_PORT}:8081" \
+    -v "$WORKDIR/data:/data" \
+    "$IMAGE" >/dev/null
+}
+
+wait_ready() {
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+in_container() { docker exec "$CONTAINER" sh -c "$1" 2>&1; }
+
+# ---------------------------------------------------------------------------
+info "准备：宿主目录属主故意设错，验证容器能自愈"
+# ---------------------------------------------------------------------------
+mkdir -p "$WORKDIR/data"
+# 宿主普通用户创建的目录通常不是 uid 1000；entrypoint 必须自行修正。
+chown "$(id -u):$(id -g)" "$WORKDIR/data" 2>/dev/null || true
+start_container
+
+# ---------------------------------------------------------------------------
+info "启动与健康检查"
+# ---------------------------------------------------------------------------
+if wait_ready; then
+  pass "容器在 120s 内就绪（数据卷属主已自动修正）"
+else
+  fail "容器未就绪"
+  echo "---- 容器日志 ----"
+  docker logs --tail 80 "$CONTAINER" 2>&1 | sed 's/^/      /'
+  echo
+  printf '\n\033[31m❌ SMOKE TEST FAILED（容器未就绪，提前退出）\033[0m\n'
+  printf '失败项：\n%s\n' "$FAILURES"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+info "无头运行与管理台启动"
+# ---------------------------------------------------------------------------
+LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
+grep -q 'electron shim active' <<<"$LOGS" \
+  && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
+grep -q 'management console listening' <<<"$LOGS" \
+  && pass "Web 管理台已监听" || fail "Web 管理台未启动"
+
+if docker run --rm --entrypoint sh "$IMAGE" \
+     -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
+  fail "镜像里存在 Xvfb/Chromium/electron 可执行文件"
+else
+  pass "镜像内无 Xvfb / Chromium / electron 可执行文件"
+fi
+
+# ---------------------------------------------------------------------------
+info "主进程已降权"
 # ---------------------------------------------------------------------------
 # 不能用 `docker exec id -u`：镜像没有设置 USER，exec 默认以 root 进入，
 # 那只反映 exec 的身份，与主进程无关。改看运行时产物的属主——文件由网关进程
 # 写入，属主即该进程的 uid，这才是降权真正生效的证据。
-RUNTIME_OWNER="$(in_container "stat -c '%u' /data/.chat2api/.management-secret" | tr -d '\r\n')"
+SECRET_FILE="/data/.chat2api/.management-secret"
+RUNTIME_OWNER="$(in_container "stat -c '%u' $SECRET_FILE" | tr -d '\r\n')"
 if [ "$RUNTIME_OWNER" = "1000" ]; then
   pass "运行时文件属主为 1000（主进程已降权到 node）"
 else
@@ -70,7 +175,6 @@ CODE_API_NOAUTH="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${AP
   && pass "直连 8080 无凭据 -> 401" \
   || fail "直连 8080 无凭据应 401，实际 $CODE_API_NOAUTH"
 
-SECRET_FILE="/data/.chat2api/.management-secret"
 SECRET="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
 if [ -n "$SECRET" ]; then
   pass "密钥已生成并写入 $SECRET_FILE"

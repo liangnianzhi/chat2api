@@ -3,7 +3,7 @@
 # 这是 Dockerfile 的**快速替代路径**，不是默认构建方式。
 #
 # 正常情况下不需要这个文件：镜像由 GitHub Actions 构建并推送到
-# ghcr.io/liangnianzhi/chat2api:latest，使用方只需 docker pull。
+# ghcr.io（官方源，仅推送用），使用方从 ghcr.nju.edu.cn 拉取。
 #
 # 本路径用于没有 buildx、磁盘 I/O 又慢的宿主（例如群晖 NAS）：Dockerfile 里的
 # `npm install`（约 500MB 层）提交会耗时数十分钟。这里直接复用一份已验证的
@@ -80,14 +80,13 @@ ENV NODE_ENV=production \
     CHAT2API_APP_DIR=/app \
     CHAT2API_SHIM=/app/shim/electron-shim.js \
     CHAT2API_BUNDLE=/app/upstream/main/headless.js \
-    CHAT2API_PORT=8080 \
+    CHAT2API_PORT=8082 \
     CHAT2API_HOST=0.0.0.0 \
-    CHAT2API_UI_PORT=8081 \
     CHAT2API_ENABLE_WEBUI=true \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
-EXPOSE 8080 8081
+EXPOSE 8082
 
 USER node
 

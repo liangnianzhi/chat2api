@@ -41,10 +41,28 @@ if [ "$(id -u)" != "0" ]; then
   fi
 fi
 
-IMAGE="ghcr.io/liangnianzhi/chat2api:latest"
 CONTAINER="${CHAT2API_CONTAINER:-chat2api}"
 PORT="${CHAT2API_PORT:-8082}"
 TIMEOUT="${CHAT2API_WAIT_SECONDS:-300}"
+
+# 镜像地址以 compose 为准，避免两处写死后不一致。
+image_from_compose() {
+  for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+    if [ -f "$f" ]; then
+      sed -n 's/^[[:space:]]*image:[[:space:]]*\(.*\)$/\1/p' "$f" | head -1 | tr -d '"\047'
+      return 0
+    fi
+  done
+  return 1
+}
+
+IMAGE="${CHAT2API_IMAGE:-}"
+if [ -z "$IMAGE" ]; then
+  IMAGE="$(image_from_compose || true)"
+fi
+if [ -z "$IMAGE" ]; then
+  IMAGE="ghcr.nju.edu.cn/liangnianzhi/chat2api:latest"
+fi
 
 container_status() {
   $SUDO "$DOCKER" inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo missing
@@ -55,12 +73,14 @@ container_health() {
     "$CONTAINER" 2>/dev/null || echo missing
 }
 
-# 容器当前实际使用的镜像 ID
 container_image() {
   $SUDO "$DOCKER" inspect -f '{{.Image}}' "$CONTAINER" 2>/dev/null || echo none
 }
 
-# 悬空镜像（<none>）：被替换下来、已无容器引用的旧版本。
+latest_image() {
+  $SUDO "$DOCKER" image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo none
+}
+
 cleanup_dangling() {
   ids="$($SUDO "$DOCKER" images -f dangling=true -q 2>/dev/null || true)"
   if [ -n "$ids" ]; then
@@ -113,7 +133,6 @@ do_wait() {
 
     sleep 5
     elapsed=$((elapsed + 5))
-    # 每 30 秒提示一次，避免刷屏
     if [ $((elapsed % 30)) -eq 0 ]; then
       echo "   ...仍在等待（已 ${elapsed}s，容器镜像未变或尚未健康）"
     fi
@@ -130,13 +149,18 @@ do_status() {
   $SUDO "$DOCKER" ps -a --filter "name=^${CONTAINER}$" \
     --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' || true
   echo
-  echo "--- 镜像 ---"
+  echo "--- 镜像（$IMAGE）---"
   $SUDO "$DOCKER" images "$IMAGE" \
     --format 'table {{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}\t{{.CreatedSince}}' || true
   echo
   echo "--- 容器使用的镜像 vs latest ---"
-  echo "   容器: $(container_image)"
-  echo "   latest: $($SUDO "$DOCKER" image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo none)"
+  echo "   容器:   $(container_image)"
+  echo "   latest: $(latest_image)"
+  if [ "$(container_image)" = "$(latest_image)" ]; then
+    echo "   → 一致（已使用最新镜像）"
+  else
+    echo "   → 不一致（已拉取新镜像，但容器还没重置）"
+  fi
   echo
   echo "--- 健康 ---"
   curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "   (无响应)"

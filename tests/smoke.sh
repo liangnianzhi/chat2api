@@ -5,24 +5,18 @@
 # Runs against a freshly created container and reports PASS/FAIL per check.
 # Used by .github/workflows/ci.yml, and runnable locally:
 #
-#   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
+#   IMAGE=ghcr.nju.edu.cn/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
 # Two modes:
 #   default        start a throwaway container (CI does this)
 #   VERIFY_URL=..  test an already-running deployment over HTTP, no docker needed
-#
-# The second mode exists because the deployment itself should be verified the
-# same way a user reaches it, and because some regressions - the proxy reporting
-# itself as stopped, for instance - are only visible from outside.
 
 set -uo pipefail
 
-IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
+IMAGE="${IMAGE:-ghcr.nju.edu.cn/liangnianzhi/chat2api:latest}"
 CONTAINER="${CONTAINER:-chat2api-smoke}"
 PORT="${PORT:-18082}"
 SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-300}"
-# When set (e.g. http://192.168.1.10:8082), verify that deployment instead of
-# creating a container.
 VERIFY_URL="${VERIFY_URL:-}"
 WORKDIR="$(mktemp -d)"
 
@@ -69,7 +63,6 @@ wait_ready() {
 
 in_container() { docker exec "$CONTAINER" sh -c "$1" 2>&1; }
 
-# ---------------------------------------------------------------------------
 if [ -n "$VERIFY_URL" ]; then
   info "验证已部署的实例：$VERIFY_URL"
   BASE="${VERIFY_URL%/}"
@@ -80,9 +73,7 @@ else
   start_container
 fi
 
-# ---------------------------------------------------------------------------
 info "启动与健康检查"
-# ---------------------------------------------------------------------------
 if wait_ready; then
   pass "服务在 180s 内就绪"
 else
@@ -97,58 +88,47 @@ else
   exit 1
 fi
 
-# ---------------------------------------------------------------------------
-info "代理确实在运行（不是只有 HTTP 活着）"
-# ---------------------------------------------------------------------------
-# /health 会把上游 proxyStatusManager 的状态报出来。曾经出现过「请求都能通，
-# 但状态是 stopped」的情况：兜底逻辑多起了一个 ProxyServer，它的 stop() 把状态
-# 覆盖掉了。界面因此显示代理已停止。这一项专门盯住它。
+info "代理确实在运行，且上报的是公开端口"
 HEALTH_JSON="$(curl -fsS "${BASE}/health" 2>/dev/null || echo '')"
 PROXY_STATE="$(grep -oE '"status":"[a-z]+"' <<<"$HEALTH_JSON" | head -1 | cut -d'"' -f4)"
 [ "$PROXY_STATE" = "running" ] \
   && pass "上游代理状态为 running" \
   || fail "上游代理状态为 '${PROXY_STATE:-无}'（应为 running）: $HEALTH_JSON"
 
-# 端口一致性：对外只有一个端口，且不应把这个内部端口当成 API 端口展示。
-PORTS_USED="$(grep -oE ':"[0-9]+"' <<<"$HEALTH_JSON" | tr -d '":' | sort -u | tr '\n' ' ')"
-[ -n "$PORTS_USED" ] && pass "health 中的端口字段: $PORTS_USED" || true
+# 界面 Header 与状态事件都从 proxyStatusManager 取值；内部绑定端口不能暴露给用户。
+STATUS_JSON="$(curl -sS -X POST "${BASE}/__ipc" -H 'Content-Type: application/json' \
+  -d '{"channel":"proxy:getStatus","args":[]}' 2>/dev/null || echo '')"
+ADVERTISED_PORT="$(grep -oE '"port":[0-9]+' <<<"$STATUS_JSON" | head -1 | grep -oE '[0-9]+')"
+[ "$ADVERTISED_PORT" = "8082" ] \
+  && pass "界面报告的端口是公开端口（8082）" \
+  || fail "界面报告的端口是 '${ADVERTISED_PORT:-无}'，应为 8082"
 
-# ---------------------------------------------------------------------------
 info "OpenAI 兼容 API"
-# ---------------------------------------------------------------------------
 MODELS="$(curl -fsS "${BASE}/v1/models" || echo '')"
 grep -q '"object":"list"' <<<"$MODELS" \
   && pass "/v1/models 返回 OpenAI 格式" || fail "/v1/models 异常: $MODELS"
 
-# 用真实端点确认可用性，而不只是看响应形状。
 CHAT_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' 2>/dev/null)"
-if [ "$CHAT_CODE" = "200" ]; then
-  pass "/v1/chat/completions 可用（200）"
-elif [ "$CHAT_CODE" = "401" ] || [ "$CHAT_CODE" = "429" ] || [ "$CHAT_CODE" = "503" ]; then
-  pass "/v1/chat/completions 端点存在（$CHAT_CODE，无账号或需密钥属正常）"
-else
-  fail "/v1/chat/completions 返回 $CHAT_CODE"
-fi
+case "$CHAT_CODE" in
+  200) pass "/v1/chat/completions 可用（200）" ;;
+  401|429|503) pass "/v1/chat/completions 端点存在（$CHAT_CODE，无账号或需密钥属正常）" ;;
+  *) fail "/v1/chat/completions 返回 $CHAT_CODE" ;;
+esac
 
-# ---------------------------------------------------------------------------
 info "管理 API：/management 与 /v0/management 等价"
-# ---------------------------------------------------------------------------
 MGMT_ALIAS="$(curl -s -w '\n%{http_code}' "${BASE}/management/accounts" || echo '')"
 MGMT_UPSTREAM="$(curl -s -w '\n%{http_code}' "${BASE}/v0/management/accounts" || echo '')"
 ALIAS_CODE="$(tail -1 <<<"$MGMT_ALIAS")"
 UPSTREAM_CODE="$(tail -1 <<<"$MGMT_UPSTREAM")"
-
 [ "$ALIAS_CODE" = 200 ] \
   && pass "/management/accounts -> 200" || fail "/management/accounts -> HTTP $ALIAS_CODE"
 [ "$ALIAS_CODE" = "$UPSTREAM_CODE" ] \
   && pass "两个前缀状态码一致（$ALIAS_CODE）" \
   || fail "前缀行为不一致: /management=$ALIAS_CODE /v0/management=$UPSTREAM_CODE"
 
-# ---------------------------------------------------------------------------
 info "上游原版界面"
-# ---------------------------------------------------------------------------
 INDEX="$(curl -fsS "${BASE}/" || echo '')"
 grep -q '/__preload.js' <<<"$INDEX" \
   && pass "页面已注入 preload 桥" || fail "页面缺少 /__preload.js"
@@ -167,16 +147,12 @@ else
   fail "页面未引用任何 /assets/ 资源"
 fi
 
-# ---------------------------------------------------------------------------
-# 以下需要进入容器，仅在自建容器模式下执行。
-# ---------------------------------------------------------------------------
 if [ -z "$VERIFY_URL" ]; then
   info "只有一个对外端口，且 API 在进程内处理"
   LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
   grep -q 'electron shim active' <<<"$LOGS" \
     && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
 
-  # docker port 每个绑定的 socket 输出一行，双栈主机会把同一宿主端口报两次。
   PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sed 's/.*://' | sort -u | tr '\n' ' ')"
   PORT_COUNT="$(echo "$PORTS" | wc -w | tr -d ' ')"
   if [ "$PORT_COUNT" = "1" ] && [ "$(echo "$PORTS" | tr -d ' ')" = "${PORT}" ]; then
@@ -186,12 +162,12 @@ if [ -z "$VERIFY_URL" ]; then
   fi
 
   grep -q 'captured the HTTP request handler' <<<"$LOGS" \
-    && pass "已捕获上游 HTTP 请求处理器" || fail "未捕获处理器（回退到了回环端口）"
+    && pass "已捕获上游 HTTP 请求处理器" || fail "未捕获处理器"
   grep -q 'API: served in-process, no second port' <<<"$LOGS" \
     && pass "API 由同一端口进程内处理" || fail "API 未走进程内处理"
 
   if in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -q ':18090 '; then
-    fail "容器内仍有 18090 在监听（合并未生效）"
+    fail "容器内仍有 18090 在监听"
   else
     pass "容器内没有 18090 监听"
   fi
@@ -233,6 +209,7 @@ console.log("ok");
   PRELOAD="$(curl -fsS "${BASE}/__preload.js" || echo '')"
   grep -q 'contextBridge' <<<"$PRELOAD" && pass "preload 桥已就绪" || fail "preload 内容异常"
   grep -q '__c2a_require' <<<"$PRELOAD" && pass "preload 桥含 require 垫片" || fail "preload 缺少垫片"
+  grep -q 'armPlaceholder' <<<"$PRELOAD" && pass "preload 桥含弹窗预开逻辑" || fail "preload 缺少弹窗处理"
 
   CODE_IPC="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/__ipc" \
     -H 'Content-Type: application/json' -d '{"channel":"__no_such_channel__","args":[]}')"
@@ -313,11 +290,17 @@ catch { process.exit(0) }
   SECRET_AFTER="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
   [ "$SECRET_AFTER" = "$SECRET" ] && pass "重启后管理密钥不变" || fail "重启后管理密钥变化"
 
-  # 重启后代理必须仍报告 running，这是状态被覆盖 bug 最易复发的时机。
-  RESTART_STATE="$(curl -fsS "${BASE}/health" 2>/dev/null | grep -oE '"status":"[a-z]+"' | head -1 | cut -d'"' -f4)"
+  # 重启后代理必须仍在运行，且仍上报公开端口。
+  RESTART_HEALTH="$(curl -fsS "${BASE}/health" 2>/dev/null || echo '')"
+  RESTART_STATE="$(grep -oE '"status":"[a-z]+"' <<<"$RESTART_HEALTH" | head -1 | cut -d'"' -f4)"
   [ "$RESTART_STATE" = "running" ] \
-    && pass "重启后代理状态仍为 running" \
-    || fail "重启后代理状态为 '${RESTART_STATE:-无}'"
+    && pass "重启后代理状态仍为 running" || fail "重启后代理状态为 '${RESTART_STATE:-无}'"
+
+  RESTART_STATUS="$(curl -sS -X POST "${BASE}/__ipc" -H 'Content-Type: application/json' \
+    -d '{"channel":"proxy:getStatus","args":[]}' 2>/dev/null || echo '')"
+  RESTART_PORT="$(grep -oE '"port":[0-9]+' <<<"$RESTART_STATUS" | head -1 | grep -oE '[0-9]+')"
+  [ "$RESTART_PORT" = "8082" ] \
+    && pass "重启后上报端口仍为 8082" || fail "重启后上报端口为 '${RESTART_PORT:-无}'"
 
   info "镜像体积预算"
   SIZE_BYTES="$(docker image inspect "$IMAGE" --format '{{.Size}}' 2>/dev/null || echo 0)"
@@ -330,7 +313,6 @@ catch { process.exit(0) }
   fi
 fi
 
-# ---------------------------------------------------------------------------
 if [ "$FAILED" = 0 ]; then
   printf '\n\033[32m✅ SMOKE TEST PASSED\033[0m\n'
   exit 0

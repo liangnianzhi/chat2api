@@ -1,6 +1,7 @@
 # Chat2API 网关 —— 全部部署配置就是这个文件
 #
-# 镜像由 GitHub Actions 构建并发布到 GHCR，本地不构建。
+# 镜像由 GitHub Actions 构建并发布，这里只负责拉取和运行。
+# 使用南京大学镜像站加速拉取（官方源为 ghcr.io，仅推送用）。
 #
 #   1. mkdir -p data
 #   2. docker compose up -d
@@ -16,7 +17,8 @@
 #   CHAT2API_API_KEY          给 /v1 客户端访问加密钥（默认不启用）
 services:
   chat2api:
-    image: ghcr.io/liangnianzhi/chat2api:latest
+    # 南京大学镜像站：拉取加速。官方 ghcr.io 仅用于 CI 推送。
+    image: ghcr.nju.edu.cn/liangnianzhi/chat2api:latest
     container_name: chat2api
     restart: unless-stopped
     ports:

@@ -28,14 +28,6 @@
  * pages, the built renderer is served as-is and its IPC calls are bridged to the
  * very same handlers Electron would have called.
  *
- * MANAGEMENT PATH
- * ---------------
- * Upstream hardcodes /v0/management and matches it in several middlewares, so the
- * prefix cannot be changed at the source. It also reads too close to OpenAI's
- * /v1. This server therefore accepts /management/* and rewrites it to
- * /v0/management/* before proxying: same behaviour, a name that cannot be
- * confused. Both prefixes work; the docs use /management.
- *
  * WHY IN-PROCESS
  * --------------
  * The handler registry lives in this process (the shim records handlers as
@@ -58,7 +50,7 @@ const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'pr
 // The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
-// The gateway's own listen address, inside the container, never published.
+// The gateway's own listen address: inside the container, never published.
 const GATEWAY = {
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
@@ -270,6 +262,12 @@ function handleEvents(req, res) {
     try { res.write(`data: ${JSON.stringify({ channel, args })}\n\n`) } catch { /* closing */ }
   }
   streamClients.add(client)
+
+  // Opens requested before anyone was listening (the OAuth case) are replayed
+  // now that there is somewhere to send them.
+  if (shim && typeof shim.__replayPendingOpens === 'function') {
+    shim.__replayPendingOpens()
+  }
 
   const heartbeat = setInterval(() => {
     try { res.write(': hb\n\n') } catch { /* closing */ }

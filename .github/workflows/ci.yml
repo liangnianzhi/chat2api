@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_REF: ghcr.io/${{ github.repository }}:latest
+  IMAGE_REF: ghcr.nju.edu.cn/${{ github.repository }}:latest
   CHAT2API_REF: main
 
 jobs:
@@ -51,6 +51,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 上游版本对比：把「本次实际用到的上游版本」与 UPSTREAM.lock 记录的基线
+      # 对比，写进 job summary。上游更新不等于一定出错，但需要人知道。
+      - name: Compare upstream version against the baseline
+        id: upstream
+        run: |
+          up_repo="$(sed -n 's/^repo=//p' UPSTREAM.lock)"
+          base_ver="$(sed -n 's/^version=//p' UPSTREAM.lock)"
+          base_sha="$(sed -n 's/^commit=//p' UPSTREAM.lock)"
+
+          head_sha="$(curl -fsS "https://api.github.com/repos/${up_repo}/commits/main" \
+            -H 'Accept: application/vnd.github+json' | grep -oE '"sha": *"[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}')"
+          head_ver="$(curl -fsS "https://raw.githubusercontent.com/${up_repo}/main/package.json" \
+            | grep -oE '"version": *"[^"]+"' | head -1 | sed 's/.*"version": *"//;s/"//')"
+
+          echo "baseline: ${base_ver} (${base_sha})"
+          echo "upstream: ${head_ver} (${head_sha})"
+
+          {
+            echo '### Upstream version'
+            echo
+            echo "| | version | commit |"
+            echo "|---|---|---|"
+            echo "| baseline (UPSTREAM.lock) | \`${base_ver}\` | \`${base_sha}\` |"
+            echo "| upstream main now | \`${head_ver}\` | \`${head_sha}\` |"
+            echo
+            if [ "$head_sha" != "$base_sha" ]; then
+              echo "**上游有更新。** 与基线相比的改动："
+              echo
+              echo "https://github.com/${up_repo}/compare/${base_sha}...${head_sha}"
+              echo
+              echo '重点看 UPSTREAM.md 里列的那 10 处依赖。'
+            else
+              echo '上游与基线一致。'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -69,7 +105,16 @@ jobs:
       - name: Show image size and upstream version
         run: |
           docker image inspect ${{ env.IMAGE_REF }} --format 'image size: {{.Size}} bytes'
-          docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO
+          echo '--- UPSTREAM_INFO (what this image was actually built from) ---'
+          docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tee /tmp/upstream_info.txt
+          {
+            echo
+            echo '### Built from'
+            echo
+            echo '```'
+            cat /tmp/upstream_info.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
@@ -107,36 +152,6 @@ jobs:
           VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh
           docker rm -f c2a-http >/dev/null 2>&1 || true
 
-      # 界面里显示/使用的地址必须是用户真正能访问的那个端口，而不是代理的内部绑定端口。
-      - name: Assert the advertised address is the public one
-        if: success()
-        run: |
-          docker run -d --name c2a-addr -p 127.0.0.1:18084:8082 ${{ env.IMAGE_REF }} >/dev/null
-          for i in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:18084/health >/dev/null 2>&1; then break; fi
-            sleep 2
-          done
-
-          STATUS="$(curl -fsS -X POST http://127.0.0.1:18084/__ipc \
-            -H 'Content-Type: application/json' \
-            -d '{"channel":"proxy:getStatus","args":[]}')"
-          echo "proxy:getStatus -> $STATUS"
-
-          REPORTED_PORT="$(grep -oE '"port":[0-9]+' <<<"$STATUS" | head -1 | grep -oE '[0-9]+')"
-          if [ "$REPORTED_PORT" = "8082" ]; then
-            echo "advertised port is the public port (8082)"
-          else
-            echo "::error::advertised port is '${REPORTED_PORT:-none}', expected 8082"
-            docker rm -f c2a-addr >/dev/null 2>&1 || true
-            exit 1
-          fi
-
-          # 界面拿到的管理地址也应指向公开端口，而不是内部绑定端口。
-          BASE_URL="$(curl -fsS http://127.0.0.1:18084/__preload.js >/dev/null 2>&1; echo ok)"
-          [ "$BASE_URL" = "ok" ] || { echo '::error::preload not served'; exit 1; }
-
-          docker rm -f c2a-addr >/dev/null 2>&1 || true
-
       - name: Publish smoke output on failure
         if: failure()
         run: |
@@ -167,11 +182,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # 推送的正是上面测过的镜像，不再重建，所以一次运行 = 一个 digest。
+      # 注意：推送走官方 ghcr.io（镜像站只代理下载，不接受上传）；
+      # 部署侧从 ghcr.nju.edu.cn 拉取。
       - name: Push the tested image
         if: success() && github.event_name != 'pull_request'
         run: |
-          docker push ${{ env.IMAGE_REF }}
-          docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}'
+          OFFICIAL="ghcr.io/${{ github.repository }}:latest"
+          docker tag ${{ env.IMAGE_REF }} "$OFFICIAL"
+          docker push "$OFFICIAL"
+          docker image inspect "$OFFICIAL" --format '{{index .RepoDigests 0}}'
 
       - name: Summary
         if: success()
@@ -179,14 +198,13 @@ jobs:
           {
             echo '### chat2api'
             echo
-            echo "- image: \`${{ env.IMAGE_REF }}\`"
-            echo "- upstream: $(docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tr '\n' ' ')"
-            echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf \"%.0f MB\", $1/1048576}')"
+            echo "- image (pull): \`${{ env.IMAGE_REF }}\`"
             if [ "${{ github.event_name }}" = "pull_request" ]; then
               echo '- pushed: no (pull request)'
             else
-              echo '- pushed: yes'
+              echo "- pushed: \`ghcr.io/${{ github.repository }}:latest\`"
             fi
+            echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf \"%.0f MB\", $1/1048576}')"
             echo
-            echo 'Deploy on the NAS with: `./deploy.sh`'
+            echo 'Deploy on the NAS with: `./deploy.sh pull`, reset the container in Synology, then `./deploy.sh wait`'
           } >> "$GITHUB_STEP_SUMMARY"

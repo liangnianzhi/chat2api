@@ -2,37 +2,24 @@
 # =============================================================================
 # 上游: https://github.com/wxs0625/Chat2API-WXS  (GPL-3.0)
 #
-# 这个镜像做什么
-# --------------
-# 上游是 Electron 桌面应用。本镜像把它整套跑在容器里，但只有**一个端口**：
-#
+# 只对外一个端口：
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
 #   /v1、/health        -> 转发给回环上的网关
 #   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
 #
-# 关键点：界面是**复用上游自己编译出来的前端**，不是重画的。shim 把上游注册的
-# 每个 ipcMain.handle 记下来，前端服务把浏览器的调用派发进去，因此所有页面和
-# 操作逻辑都是上游原版，且随上游更新自动跟进。
-#
-# 四个关键机制
-# ------------
-# 1. shim/headless-entry.ts —— 作为额外的 Rollup 入口编进上游 bundle。
-# 2. shim/electron-shim.js —— Electron 兼容层 + IPC 登记 + 事件总线。
-# 3. 用 shim 替换 node_modules/electron —— 一次性拦截所有 require('electron')。
-# 4. webui/server.js —— 唯一对外端口：发前端、桥接 IPC、反代 API。
-#
 # 源码获取
 # --------
-# 默认从 codeload 下载上游 tarball。若把同一个文件放到 build/upstream-src.tar.gz
-# （已在 .dockerignore 中排除），则直接使用、跳过下载 —— 网络受限的机器（例如
-# NAS）用这种方式构建。
+# 默认从 codeload 下载上游 tarball。网络受限时（例如 NAS 上 codeload 很慢），
+# 把同一个文件放到 build/upstream-src.tar.gz 即可跳过下载：
 #
-# 为什么必须分两个阶段
-# --------------------
-# `npm install` 会产生约 500MB 的层。若在同一阶段里事后删除无用依赖，
-# 那些文件仍留在镜像历史中（后续层只记录 whiteout 标记）。只有把裁剪放在
-# builder 阶段、再 COPY 裁剪后的结果，才能让死重不进最终镜像。
+#   mkdir -p build
+#   curl -fsSL -o build/upstream-src.tar.gz \
+#     https://codeload.github.com/wxs0625/Chat2API-WXS/tar.gz/main
+#   docker build -t chat2api:latest .
+#
+# 该文件是构建输入，.dockerignore 已排除它（来自 build/ 的都会进 COPY，但只有
+# 名字匹配的那个会被当作源码包）。
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
@@ -49,18 +36,14 @@ RUN apk add --no-cache curl
 
 WORKDIR /build
 
-# 优先用预置的源码包；没有才去下载。
-COPY build/upstream-src.tar.gz* /build/prefetched/
+# build/ 始终存在（有 .gitkeep），所以这个 COPY 不会因缺少预置包而失败。
+COPY build/ /build/prefetched/
 
 RUN set -eux; \
     mkdir -p /build/upstream; \
-    src=''; \
-    for candidate in /build/prefetched/upstream-src.tar.gz /build/prefetched/upstream-src.tar.gz*; do \
-      if [ -s "$candidate" ]; then src="$candidate"; break; fi; \
-    done; \
-    if [ -n "$src" ]; then \
-      echo "using prefetched source: $src"; \
-      tar -xzf "$src" -C /build/upstream --strip-components=1; \
+    if [ -s /build/prefetched/upstream-src.tar.gz ]; then \
+      echo 'using prefetched source: build/upstream-src.tar.gz'; \
+      tar -xzf /build/prefetched/upstream-src.tar.gz -C /build/upstream --strip-components=1; \
     else \
       url="https://codeload.github.com/${CHAT2API_REPO}/tar.gz/${CHAT2API_REF}"; \
       echo "fetching ${url}"; \

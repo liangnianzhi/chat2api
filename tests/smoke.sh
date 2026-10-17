@@ -34,7 +34,13 @@ info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 cleanup() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  rm -rf "$WORKDIR"
+  # The container writes into the bind mount as uid 1000, which the runner user
+  # may not be able to remove directly.
+  if command -v sudo >/dev/null 2>&1; then
+    sudo rm -rf "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR" 2>/dev/null || true
+  else
+    rm -rf "$WORKDIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -79,15 +85,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-info "日志：无 Electron，且管理台已启动"
+info "无头运行与管理台启动"
 # ---------------------------------------------------------------------------
 LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
 grep -q 'electron shim active' <<<"$LOGS" \
   && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
 grep -q 'management console listening' <<<"$LOGS" \
   && pass "Web 管理台已监听" || fail "Web 管理台未启动"
-grep -q 'management API is enabled' <<<"$LOGS" \
-  && pass "仅凭密钥自动启用了管理 API" || fail "管理 API 未自动启用"
+
+# 只给了管理密钥、没设任何开关，管理 API 应自动启用。
+# 用功能行为判定而不是匹配日志文案：未启用时管理路由为 404，
+# 启用而未鉴权为 401。（日志文案会随重构变化，行为不会。）
+CODE_AUTO="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
+[ "$CODE_AUTO" = 401 ] \
+  && pass "仅凭密钥自动启用了管理 API（未鉴权 -> 401，而非 404）" \
+  || fail "管理 API 未自动启用，实际 $CODE_AUTO"
 
 # 无头构建不应出现 Chromium / Xvfb 相关依赖
 if docker run --rm --entrypoint sh "$IMAGE" \

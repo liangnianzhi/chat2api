@@ -1,0 +1,15 @@
+# 数据卷：含账号凭证与加密密钥，绝不入库
+/data/
+.freshdata/
+
+# 本地构建产物
+.build/
+*.log
+
+# 本地配置（含管理密钥）
+.env
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+node_modules/

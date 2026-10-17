@@ -38,8 +38,8 @@ jobs:
 
       - name: Shell syntax check
         run: |
-          sh -n manage.sh
           bash -n tests/smoke.sh
+          sh -n shim/entrypoint.sh
           echo 'shell syntax OK'
 
       - name: ShellCheck
@@ -47,7 +47,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
           # Only fail on errors, not style nits.
-          shellcheck --severity=error manage.sh tests/smoke.sh
+          shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
 
   # ---------------------------------------------------------------------------
   # Build, deploy, test - and publish to GHCR on main/tags.
@@ -81,13 +81,12 @@ jobs:
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
 
-      # Exercise the documented deployment path: docker compose, not just docker
-      # run. This is what operators actually follow.
+      # Exercise the documented deployment path exactly as documented: only
+      # mkdir + compose up. No .env, no manual chown - if that stops working,
+      # the docs are wrong.
       - name: Bring the stack up via compose
-        env:
-          CHAT2API_MANAGEMENT_SECRET: ci-compose-secret
         run: |
-          mkdir -p data && sudo chown -R 1000:1000 data
+          mkdir -p data
           docker compose up -d
 
           for i in $(seq 1 60); do
@@ -98,10 +97,11 @@ jobs:
           echo '--- /health ---'
           curl -fsS http://127.0.0.1:8080/health
           echo
-          echo '--- web console ---'
+          echo '--- web console (no login) ---'
           curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8081/
+          echo '--- console proxy reaches the management API ---'
+          curl -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8081/v0/management/providers
 
-          # Confirm compose used the image we just built, not a pulled one.
           echo '--- image used by the container ---'
           docker inspect chat2api --format '{{.Config.Image}} / {{.Image}}'
 
@@ -111,8 +111,8 @@ jobs:
           docker compose logs --tail 40 || true
           docker compose down -v || true
 
-      # The deep functional suite: auth, account CRUD, credential encryption,
-      # persistence across restarts, console proxy whitelist, image size budget.
+      # The deep functional suite: console, account CRUD, credential encryption,
+      # persistence across restarts, proxy whitelist, image size budget.
       - name: Run container smoke tests
         run: |
           IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh

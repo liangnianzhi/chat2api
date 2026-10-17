@@ -15,7 +15,7 @@
 #    （storeManager / ProxyServer）会被整个删掉；新增入口让打包器"看见"它们。
 #
 # 2. shim/electron-shim.js —— 实现代理真正用到的 Electron API：
-#    safeStorage（AES-256-GCM，密钥落在数据卷，重启后仍能解密）、app、net；
+#    safeStorage（AES-256-GCM）、app、net、process.resourcesPath；
 #    GUI-only 功能（验证码窗、托盘）明确抛错而非静默失败。
 #
 # 3. 用 shim 替换 node_modules/electron —— 编译产物和 Rollup 拆出的
@@ -28,9 +28,6 @@
 # 那些文件仍留在镜像历史中（后续层只记录 whiteout 标记），最终镜像仍是
 # 600MB 左右。只有把裁剪放在 builder 阶段、再 COPY 裁剪后的结果，
 # 才能让死重不进最终镜像。
-#
-# 上游的 externalizeDepsPlugin 会内联绝大多数依赖，运行时磁盘上只需
-# exclude 列表里那几个包 —— 实测裁剪后 node_modules 仅 3.8MB（原 302MB）。
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
@@ -98,6 +95,7 @@ RUN set -eux; \
 # 组装一个干净的运行目录，供下阶段整体 COPY。
 COPY shim/electron-shim.js /build/stage/shim/electron-shim.js
 COPY shim/gateway.js /build/stage/shim/gateway.js
+COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
 COPY webui/ /build/stage/webui/
 
 RUN set -eux; \
@@ -123,13 +121,13 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM node:${NODE_VERSION} AS runtime
 
-LABEL org.opencontainers.image.title="Chat2API Gateway" \
+LABEL org.opencontainers.image.title="chat2api" \
       org.opencontainers.image.description="Headless OpenAI-compatible gateway for Chat2API with a web console (no Electron/Xvfb)" \
       org.opencontainers.image.source="https://github.com/liangnianzhi/chat2api" \
       org.opencontainers.image.licenses="GPL-3.0"
 
-# curl 用于健康检查；tini 回收子进程并转发信号，保证 supervisor 优雅退出。
-RUN apk add --no-cache curl tini tzdata
+# curl 用于健康检查；tini 回收子进程并转发信号；su-exec 用于降权。
+RUN apk add --no-cache curl tini tzdata su-exec
 
 # node 官方镜像已有 uid/gid 1000（node），复用它以免 addgroup -g 1000 冲突。
 # Alpine 无 usermod，用 awk 改 /etc/passwd 第 6、7 字段并校验仍是 7 段。
@@ -148,6 +146,7 @@ WORKDIR /app
 COPY --from=builder /build/stage/ /app/
 
 RUN set -eux; \
+    chmod +x /app/shim/entrypoint.sh; \
     node -e "const e=require('/app/node_modules/electron'); \
              if(!e.__isShim){console.error('electron 未指向 shim');process.exit(1)}; \
              console.log('electron -> shim 校验通过')"; \
@@ -172,9 +171,8 @@ ENV NODE_ENV=production \
 VOLUME ["/data"]
 EXPOSE 8080 8081
 
-USER node
-
-# 健康检查打在网关自身的 /health（管理台是可选组件，不该影响容器健康判定）
+# 不写 USER：entrypoint.sh 需要 root 修正数据卷属主，随后降权到 node 运行。
+# HEALTHCHECK 打在网关自身的 /health（管理台是可选组件，不影响健康判定）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
 

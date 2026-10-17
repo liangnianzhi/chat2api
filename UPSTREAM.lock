@@ -1,0 +1,20 @@
+# 上游版本基线
+#
+# 本文件记录「本项目当前跟随的上游版本」。CI 每次构建都会解析出实际使用的
+# 上游版本与提交，并与这里比对，把差异写进 job summary。
+#
+# 升级流程与「适配层依赖上游哪些内部结构」见 UPSTREAM.md。
+
+repo=wxs0625/Chat2API-WXS
+
+# 当前跟随的上游版本（package.json 的 version）
+version=1.7.16
+
+# 当前跟随的上游提交（核对日期当天的 main 头）
+commit=b306c19fcb9fae78a4acfa365f22167c00d6389a
+
+# 跟踪方式：branch = 跟随 main 头（会变化）；commit = 锁定到上面的提交
+tracking=branch
+
+# 上次核对日期
+checked_at=2026-10-18

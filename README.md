@@ -41,10 +41,9 @@ docker compose up -d
 | `/management/*` | 管理 API |
 | `/health` | 健康检查 |
 
-容器内部还有一个 **回环地址**（`127.0.0.1:18090`）供网关自己监听。
-它是实现细节，**不会发布到宿主**：上游的 `ProxyServer` 必须绑定一个具体端口，
-而 8082 被前端服务占着（发界面 + 桥接 IPC），所以内部拆成两段。
-你不需要配置它、也不需要记住它。
+容器内部还有一个**回环地址**供网关自己监听。它是实现细节，**不会发布到宿主**：
+上游的 `ProxyServer` 必须绑定一个具体端口，而 8082 被前端服务占着
+（发界面 + 桥接 IPC），所以内部拆成两段。你不需要配置它、也不需要记住它。
 
 ### 客户端接入
 
@@ -173,6 +172,69 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 > 背景：群晖的 btrfs 数据卷挂载带 `noacl,synoacl`，走 DSM 自有 ACL，
 > 光靠 rwx 位不够，必须属主 uid 与容器内用户一致。
 
+## 发布流程（重要）
+
+工作流**不会在每次 push 时构建** —— 一轮修改通常跨多个提交，每个都构建很浪费。
+
+```
+1. 把这一轮改动全部提交完
+2. Actions → build → Run workflow（选 main）
+3. 一次点击完成：构建 → 部署验证 → 冒烟测试 → 推送 latest
+```
+
+只有全部通过才会推送；任何一步失败都不会动 GHCR 上的 `latest`。
+
+**PR 会自动构建并测试（不推送）** —— 这是唯一保留的自动构建路径，用于合并前验证。
+
+### 关于 `sha256:` 是什么
+
+那不是标签，而是**镜像摘要（digest）**：内容寻址的哈希，不可变。
+
+之前一次运行会出现**两个** digest，是因为旧流程构建了两次：
+先 `load` 一份供测试，再 `build --push` 完整重建一份用于推送。
+现在只构建一次，直接用测过的那份推送，所以**一次运行 = 一个 digest**。
+
+```bash
+docker image inspect ghcr.io/liangnianzhi/chat2api:latest \
+  --format '{{index .RepoDigests 0}}'
+```
+
+推荐固定到 digest 而不是 `latest`（更可复现）：
+
+```yaml
+image: ghcr.io/liangnianzhi/chat2api@sha256:...
+```
+
+### 流水线
+
+```
+lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 → 推送
+```
+
+冒烟测试覆盖：
+
+- 无头运行、**只有一个发布端口**、镜像内无 Chromium/Xvfb
+- 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权
+- **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
+- 上游界面已就绪、preload 桥注入、静态资源可访问、`/__ipc` 能派发真实 channel
+- **浏览器打开链路**（OAuth 依赖）+ 无订阅者时请求排队不丢失
+- **`/management` 与 `/v0/management` 状态码与结构一致**
+- `/v1/models`、`/health`
+- 账号增删、凭证掩码、客户端 API 密钥
+- AES-GCM 加解密往返、密文不含明文、篡改可检测
+- 加密密钥与管理密钥均持久化；**重启后账号与密钥均不变**
+- 镜像体积预算
+
+本地也能跑：
+
+```bash
+IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
+```
+
+上游版本由工作流里的 `CHAT2API_REF` 控制（默认 `main`）。构建时若
+`out/main/headless.js`、`out/renderer/index.html` 或 `out/preload/index.js`
+任一未产出，Dockerfile 会**直接失败报警**。
+
 ## 实现原理（代理部分）
 
 整个代理层 92 个源文件里**只有 3 个**碰 Electron：
@@ -208,41 +270,6 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 **3. 用 shim 替换 `node_modules/electron`**：编译产物和 Rollup 拆出的
 `chunks/*.js` 都会 `require('electron')`，换包是一次性拦截所有调用点。
 
-## 上游更新与 CI
-
-```
-lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 → 推送 GHCR
-```
-
-触发：push、PR、tag、手动，外加**每周一次定时构建**。
-
-> 定时构建的理由：本方案依赖上游若干内部结构（`store.ts` 的 Electron 引用、
-vite 配置的 `rollupOptions.input`、`ipc/handlers.ts` 的注册方式、preload 输出格式）。
-> 定时构建能把「上游悄悄改坏了」变成一次失败的任务。
-
-冒烟测试覆盖：
-
-- 无头运行、**只有一个发布端口**、镜像内无 Chromium/Xvfb
-- 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权
-- **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
-- 上游界面已就绪、preload 桥注入、静态资源可访问、`/__ipc` 能派发真实 channel
-- **浏览器打开链路**（OAuth 依赖）+ 无订阅者时请求排队不丢失
-- **`/management` 与 `/v0/management` 状态码与结构一致**
-- `/v1/models`、`/health`
-- 账号增删、凭证掩码、客户端 API 密钥
-- AES-GCM 加解密往返、密文不含明文、篡改可检测
-- 加密密钥与管理密钥均持久化；**重启后账号与密钥均不变**
-- 镜像体积预算
-
-本地也能跑：
-
-```bash
-IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
-```
-
-构建时若 `out/main/headless.js`、`out/renderer/index.html` 或
-`out/preload/index.js` 任一未产出，Dockerfile 会**直接失败报警**。
-
 ## 目录结构
 
 ```
@@ -273,7 +300,7 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
    302MB 依赖全进镜像，仅 `electron` 一个就 315MB。
 2. 「先装后删」不减小镜像 —— 镜像按层累积，后续层删除只记 whiteout 标记。
 
-改成两阶段后：**1.01 GB → ~160 MB**，`node_modules` 从 302MB 降到几 MB。
+改成两阶段后：**1.01 GB → ~160 MB**。
 裁剪依据是上游 `externalizeDepsPlugin` 的 `exclude` 列表，
 `shim/prune-deps.js` 递归保留依赖闭包并在**缺包时让构建失败**。
 
@@ -282,9 +309,12 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 **拉取镜像 403 / denied / 卡住**
 GHCR 包默认私有，匿名拉取会被卡住。改为 Public，或先 `docker login ghcr.io`。
 
+**改了代码但 GHCR 上还是旧的**
+推送只在手动触发时发生。Actions → build → Run workflow。
+
 **点 OAuth 登录没反应**
-确认镜像是修好 openExternal 的版本（`docker compose pull` 更新）。
-实际上上游的 OAuth 只是「打开浏览器登录页」，登录后仍需手动贴 token。
+确认镜像是修好 openExternal 的版本。另外上游的 OAuth 只是「打开浏览器登录页」，
+登录后仍需手动贴 token。
 
 **界面打不开但 /v1 正常**
 看日志里有没有 `IPC bridge unavailable` —— 上游改了 `ipc/handlers.ts` 的注册方式。

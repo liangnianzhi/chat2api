@@ -1,11 +1,18 @@
 name: build
 
-# 构建时机：手动触发（Actions → build → Run workflow）。
-# PR 仍会自动构建并测试（不推送），用于合并前验证。
+# 构建时机：push 到 main 时自动构建、测试并推送 latest。
+#
+# 一轮改动通常跨多个提交，每次 push 都会构建；如果想把多个改动合成一次构建，
+# 可以把它们合成一次提交再 push。
+#
+# PR 也会构建并测试（不推送），用于合并前验证。
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -91,7 +98,7 @@ jobs:
           set -o pipefail
           IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
 
-      # 把失败输出写进 job summary：无需认证、可直接在网页上读。
+      # 失败输出写进 job summary：无需认证，直接在运行页面上可读。
       - name: Publish smoke output on failure
         if: failure()
         run: |
@@ -100,7 +107,6 @@ jobs:
             echo '### Smoke test output'
             echo
             echo '```'
-            # 去掉 ANSI 颜色，避免在 summary 里显示成乱码
             sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -120
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -121,15 +127,16 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to GHCR
-        if: success() && github.event_name == 'workflow_dispatch'
+        if: success() && github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 推送的正是上面测过的镜像，不再重建，所以一次运行 = 一个 digest。
       - name: Push the tested image
-        if: success() && github.event_name == 'workflow_dispatch'
+        if: success() && github.event_name != 'pull_request'
         run: |
           docker push ${{ env.IMAGE_REF }}
           docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}'
@@ -143,9 +150,9 @@ jobs:
             echo "- image: \`${{ env.IMAGE_REF }}\`"
             echo "- upstream: $(docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tr '\n' ' ')"
             echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf \"%.0f MB\", $1/1048576}')"
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              echo '- pushed: yes'
-            else
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
               echo '- pushed: no (pull request)'
+            else
+              echo '- pushed: yes'
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -9,8 +9,8 @@
  * script cannot require() them.
  *
  * Adding this file as an extra Rollup input makes the bundler see real imports
- * of both and keep them. The result is out/main/headless.js: a self-contained
- * bundle that runs the app with no Electron GUI.
+ * of all of them. The result is out/main/headless.js: a self-contained bundle
+ * that runs the app with no Electron GUI.
  *
  * It is copied into src/main/ at image build time and never touches upstream
  * behaviour: the normal GUI entry (index.ts) is unchanged.
@@ -49,9 +49,9 @@ const WEBUI_ENABLED = envBool('CHAT2API_ENABLE_WEBUI', true)
 const ENV_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
 
 /**
- * The console drives the management API, so that API must be on whenever the
- * console is. Requiring a second flag (and a secret) just to get a working UI is
- * friction with no benefit: the secret is generated automatically below.
+ * The UI drives the management API, so that API must be on whenever the UI is.
+ * Requiring a second flag (and a secret) just to get a working UI is friction
+ * with no benefit: the secret is generated automatically below.
  */
 const MANAGEMENT_API_ENABLED =
   envBool('CHAT2API_ENABLE_MANAGEMENT_API', false) || WEBUI_ENABLED
@@ -61,9 +61,9 @@ const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
   // The proxy listens on loopback only. The front server owns the single public
-  // port and proxies here, so the UI and the API share one address - the way the
-  // desktop app presented them.
-  port: envInt('CHAT2API_INTERNAL_PORT', 18080),
+  // port (8082) and proxies here, so the UI and the API share one address - the
+  // way the desktop app presented them.
+  port: envInt('CHAT2API_INTERNAL_PORT', 18090),
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   apiKey: process.env.CHAT2API_API_KEY || '',
   enableApiKey: envBool('CHAT2API_ENABLE_API_KEY', Boolean(process.env.CHAT2API_API_KEY)),
@@ -81,9 +81,9 @@ console.log('[headless] gateway listening on', `${CONFIG.host}:${CONFIG.port}`)
 /**
  * Publish the effective management secret where the front server can read it.
  *
- * The console runs outside this process and cannot decrypt data.json, so the
- * secret is mirrored to a 0600 file on the same volume. This is the same trust
- * boundary as the credential-encryption key stored alongside it.
+ * The front server runs in this process but a browser cannot decrypt data.json,
+ * so the secret is mirrored to a 0600 file on the same volume. This is the same
+ * trust boundary as the credential-encryption key stored alongside it.
  */
 function writeSecretFile(secret: string): void {
   try {
@@ -151,7 +151,7 @@ async function reconcileConfig(): Promise<void> {
     let effectiveSecret: string = ENV_SECRET || currentMgmt.managementApiSecret || ''
     if (!effectiveSecret) {
       effectiveSecret = randomBytes(32).toString('hex')
-      console.log('[headless] generated a management secret for the console')
+      console.log('[headless] generated a management secret for the UI')
     }
 
     if (
@@ -190,7 +190,7 @@ async function reconcileConfig(): Promise<void> {
  * renderer-facing API surface and starts the proxy (autoStartProxy above). The
  * fallback exists because those handlers pull in tray / updater / oauth code; if
  * any of it cannot initialise headlessly we still serve the API, just without
- * the UI bridge.
+ * the UI bridge (the UI then reports its failure instead of pretending).
  * ------------------------------------------------------------------ */
 interface ProxyStatusLike { isRunning: boolean; port?: number; host?: string }
 
@@ -230,10 +230,6 @@ async function startProxy(): Promise<void> {
     process.exit(1)
   }
 
-  const providers = storeManager.getProviders()
-  const accounts = storeManager.getAccounts()
-  console.log(`[headless] ready - providers: ${providers.length}, accounts: ${accounts.length}`)
-
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`[headless] received ${signal}, shutting down`)
     try {
@@ -272,7 +268,7 @@ async function main(): Promise<void> {
   const accounts = storeManager.getAccounts()
   console.log(`[headless] ready - providers: ${providers.length}, accounts: ${accounts.length}`)
   if (accounts.length === 0) {
-    console.log('[headless] no accounts configured yet - open the web console')
+    console.log('[headless] no accounts configured yet - open the web UI')
   }
 
   // Flush upstream's buffered log writers on the way out so the data volume

@@ -1,6 +1,0 @@
-const CONFIG = {
-  // The proxy listens on loopback only. The front server owns the single public
-  // port and proxies here, so the UI and the API share one address - the way the
-  // desktop app presented them.
-  port: envInt('CHAT2API_INTERNAL_PORT', 18090),
-  host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',

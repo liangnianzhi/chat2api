@@ -1,0 +1,76 @@
+# Smoke test output (run 38985389877, commit 84d323fca3d99aaf4cec97a17fd38f95488c4d07)
+
+```
+
+[1m== 准备：数据卷与容器[0m
+
+[1m== 启动与健康检查[0m
+  [32mPASS[0m  容器在 120s 内就绪
+
+[1m== 日志：无 Electron，且管理台已启动[0m
+  [32mPASS[0m  electron shim 已生效
+  [32mPASS[0m  Web 管理台已监听
+  [31mFAIL[0m  管理 API 未自动启用
+  [32mPASS[0m  镜像内无 Xvfb / Chromium / electron 可执行文件
+
+[1m== 上游 wasm 依赖（DeepSeek/GLM 签名）[0m
+  [32mPASS[0m  process.resourcesPath 可用且能定位 wasm
+
+[1m== OpenAI 兼容 API[0m
+  [32mPASS[0m  /health 返回 running
+  [32mPASS[0m  /v1/models 返回 OpenAI 格式
+
+[1m== 管理 API 鉴权[0m
+  [32mPASS[0m  无密钥访问管理 API -> 401
+  [32mPASS[0m  错误密钥 -> 401
+  [32mPASS[0m  正确密钥 -> 200
+
+[1m== Web 管理台[0m
+  [32mPASS[0m  管理台页面可访问
+  [32mPASS[0m  管理台拒绕非白名单路径（/v1/models -> 404）
+
+[1m== 账号写入与读取[0m
+  [32mPASS[0m  添加账号成功
+  [32mPASS[0m  账号出现在列表中
+  [32mPASS[0m  列表未泄露明文凭证（已掩码）
+
+[1m== 客户端 API 密钥[0m
+  [32mPASS[0m  生成客户端 API 密钥
+
+[1m== 凭证加密（AES-256-GCM）[0m
+  [32mPASS[0m  加解密往返、无明文泄露、篡改可检测
+  [32mPASS[0m  加密密钥持久化在数据卷
+  [32mPASS[0m  data.json 为密文
+
+[1m== 重启后配置与账号持久化[0m
+  [32mPASS[0m  重启后容器就绪
+  [32mPASS[0m  重启后账号仍在
+
+[1m== 管理密钥改自环境变量[0m
+  [32mPASS[0m  换密钥后容器就绪
+  [32mPASS[0m  新密钥生效（环境变量优先）
+  [32mPASS[0m  旧密钥已失效
+
+[1m== 镜像体积预算[0m
+      镜像体积: 181 MB（预算 250 MB）
+  [32mPASS[0m  镜像体积在预算内
+
+[31m❌ SMOKE TEST FAILED[0m
+失败项：
+  - 管理 API 未自动启用
+---- 容器日志 ----
+[gateway] electron shim active
+[headless] Chat2API gateway starting
+[headless] listening target: 0.0.0.0:8080
+[headless] management secret updated from environment
+[headless] config reconciled: managementApi, minimizeToTray
+[SessionManager] Cleanup scheduler started, interval: 1 minute
+[SessionManager] Initialized
+[headless] ready - providers: 1, accounts: 1
+[webui] management console listening on http://0.0.0.0:8081
+[webui] proxying /v0/management/* -> http://127.0.0.1:8080
+rm: cannot remove '/tmp/tmp.xITa3o0U3T/data/.chat2api/request-logs/request-logs.ndjson': Permission denied
+rm: cannot remove '/tmp/tmp.xITa3o0U3T/data/.chat2api/data.json': Permission denied
+rm: cannot remove '/tmp/tmp.xITa3o0U3T/data/.chat2api/logs/app-logs.ndjson': Permission denied
+rm: cannot remove '/tmp/tmp.xITa3o0U3T/data/.chat2api/.safe-storage-key': Permission denied
+```

@@ -2,24 +2,39 @@
 # =============================================================================
 # 上游: https://github.com/wxs0625/Chat2API-WXS  (GPL-3.0)
 #
-# 只对外一个端口：
+# 这个镜像做什么
+# --------------
+# 上游是 Electron 桌面应用。本镜像把它整套跑在容器里，但只有**一个端口**：
+#
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
 #   /v1、/health        -> 转发给回环上的网关
 #   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
 #
-# 源码获取
-# --------
-# 默认从 codeload 下载上游 tarball。网络受限时（例如 NAS 上 codeload 很慢），
-# 把同一个文件放到 build/upstream-src.tar.gz 即可跳过下载：
+# 关键点：界面是**复用上游自己编译出来的前端**，不是重画的。shim 把上游注册的
+# 每个 ipcMain.handle 记下来，前端服务把浏览器的调用派发进去，因此所有页面和
+# 操作逻辑都是上游原版，且随上游更新自动跟进。
 #
-#   mkdir -p build
-#   curl -fsSL -o build/upstream-src.tar.gz \
-#     https://codeload.github.com/wxs0625/Chat2API-WXS/tar.gz/main
-#   docker build -t chat2api:latest .
+# 四个关键机制
+# ------------
+# 1. shim/headless-entry.ts —— 作为额外的 Rollup 入口编进上游 bundle。
+#    上游打包会把主进程 tree-shake 成单个 bundle，外部没人引用的导出会被删掉；
+#    新增入口让打包器"看见" storeManager / ProxyServer / registerIpcHandlers。
 #
-# 该文件是构建输入，.dockerignore 已排除它（来自 build/ 的都会进 COPY，但只有
-# 名字匹配的那个会被当作源码包）。
+# 2. shim/electron-shim.js —— 实现代理与 UI 桥都需要的那部分 Electron：
+#    safeStorage（AES-256-GCM）、app、net、process.resourcesPath，
+#    以及 ipcMain（登记而非空实现）、BrowserWindow 桩、事件总线。
+#
+# 3. 用 shim 替换 node_modules/electron —— 编译产物和 Rollup 拆出的 chunks/*.js
+#    都会 require('electron')，且分块位置随上游重构变化，换包是唯一稳定的拦截点。
+#
+# 4. webui/server.js —— 唯一对外端口：发上游前端、桥接 IPC 与事件、反代 API。
+#
+# 为什么必须分两个阶段
+# --------------------
+# `npm install` 会产生约 500MB 的层。若在同一阶段里事后删除无用依赖，
+# 那些文件仍留在镜像历史中（后续层只记录 whiteout 标记）。只有把裁剪放在
+# builder 阶段、再 COPY 裁剪后的结果，才能让死重不进最终镜像。
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
@@ -36,24 +51,16 @@ RUN apk add --no-cache curl
 
 WORKDIR /build
 
-# build/ 始终存在（有 .gitkeep），所以这个 COPY 不会因缺少预置包而失败。
-COPY build/ /build/prefetched/
-
 RUN set -eux; \
+    url="https://codeload.github.com/${CHAT2API_REPO}/tar.gz/${CHAT2API_REF}"; \
+    echo "fetching ${url}"; \
+    curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+         --connect-timeout 20 --max-time 600 \
+         -o /build/src.tar.gz "$url"; \
     mkdir -p /build/upstream; \
-    if [ -s /build/prefetched/upstream-src.tar.gz ]; then \
-      echo 'using prefetched source: build/upstream-src.tar.gz'; \
-      tar -xzf /build/prefetched/upstream-src.tar.gz -C /build/upstream --strip-components=1; \
-    else \
-      url="https://codeload.github.com/${CHAT2API_REPO}/tar.gz/${CHAT2API_REF}"; \
-      echo "fetching ${url}"; \
-      curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
-           --connect-timeout 20 --max-time 600 \
-           -o /build/src.tar.gz "$url"; \
-      tar -xzf /build/src.tar.gz -C /build/upstream --strip-components=1; \
-    fi; \
+    tar -xzf /build/src.tar.gz -C /build/upstream --strip-components=1; \
     test -f /build/upstream/package.json; \
-    echo 'source ready'
+    echo "source extracted"
 
 WORKDIR /build/upstream
 
@@ -91,12 +98,14 @@ RUN set -eux; \
       ls -la out; exit 1; }; \
     echo 'main + renderer + preload produced'
 
+# 把 node_modules 裁到运行时真正需要的那几个包。
 COPY shim/prune-deps.js /build/prune-deps.js
 
 RUN set -eux; \
     node /build/prune-deps.js; \
     echo "--- 裁剪后: $(du -sh node_modules | cut -f1), $(ls node_modules | wc -l) 项"
 
+# 组装一个干净的运行目录，供下阶段整体 COPY。
 COPY shim/electron-shim.js /build/stage/shim/electron-shim.js
 COPY shim/gateway.js /build/stage/shim/gateway.js
 COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
@@ -131,8 +140,11 @@ LABEL org.opencontainers.image.title="chat2api" \
       org.opencontainers.image.source="https://github.com/liangnianzhi/chat2api" \
       org.opencontainers.image.licenses="GPL-3.0"
 
+# curl 用于健康检查；tini 回收子进程并转发信号；su-exec 用于降权。
 RUN apk add --no-cache curl tini tzdata su-exec
 
+# node 官方镜像已有 uid/gid 1000（node），复用它以免 addgroup -g 1000 冲突。
+# Alpine 无 usermod，用 awk 改 /etc/passwd 第 6、7 字段并校验仍是 7 段。
 RUN set -eux; \
     awk -F: 'BEGIN{OFS=":"} $1=="node"{$6="/data"; $7="/sbin/nologin"} {print}' \
         /etc/passwd > /etc/passwd.new; \
@@ -144,6 +156,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
+# 只复制裁剪后的成果：依赖 + 编译产物 + 上游前端。
 COPY --from=builder /build/stage/ /app/
 
 RUN set -eux; \
@@ -176,8 +189,11 @@ ENV NODE_ENV=production \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
+# 对外只暴露一个端口：上游界面和 API 共用
 EXPOSE 8082
 
+# 不写 USER：entrypoint.sh 以 root 启动，先修正数据卷属主，再降权到 node 运行。
+# ENTRYPOINT 必须包含 entrypoint.sh，否则脚本根本不会被执行（CMD 只是它的参数）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
 

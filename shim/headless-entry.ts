@@ -24,6 +24,7 @@ import * as electron from 'electron'
 
 import { storeManager } from './store/store'
 import { ProxyServer } from './proxy/server'
+import { proxyStatusManager } from './proxy/status'
 
 /* ------------------------------------------------------------------ *
  * Environment-driven configuration
@@ -50,8 +51,6 @@ const ENV_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
 
 /**
  * The UI drives the management API, so that API must be on whenever the UI is.
- * Requiring a second flag (and a secret) just to get a working UI is friction
- * with no benefit: the secret is generated automatically below.
  */
 const MANAGEMENT_API_ENABLED =
   envBool('CHAT2API_ENABLE_MANAGEMENT_API', false) || WEBUI_ENABLED
@@ -60,11 +59,19 @@ const DATA_DIR = process.env.CHAT2API_HOME || join(process.env.HOME || '/data', 
 const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
-  // The proxy listens on this address. The shim captures the bind and hands the
-  // request handler to the front server, so this port is never actually opened -
-  // it only has to match what the shim expects to intercept.
+  // The proxy's own bind attempt. The shim intercepts this bind and hands the
+  // request handler to the front server, so this port is never actually opened.
   port: envInt('CHAT2API_INTERNAL_PORT', 18090),
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
+
+  // The port and address users actually reach. Everything user-facing reports
+  // these: the header badge, the management-API base URL the UI shows, and
+  // proxy:getStatus. They are NOT where the proxy binds.
+  publicPort: envInt('CHAT2API_PUBLIC_PORT', envInt('CHAT2API_PORT', 8082)),
+  publicHost: process.env.CHAT2API_PUBLIC_HOST
+    || process.env.CHAT2API_HOST
+    || '0.0.0.0',
+
   apiKey: process.env.CHAT2API_API_KEY || '',
   enableApiKey: envBool('CHAT2API_ENABLE_API_KEY', Boolean(process.env.CHAT2API_API_KEY)),
   logLevel: process.env.CHAT2API_LOG_LEVEL || 'info',
@@ -79,10 +86,6 @@ console.log('[headless] Chat2API starting')
 
 /**
  * Publish the effective management secret where the front server can read it.
- *
- * The front server runs in this process but a browser cannot decrypt data.json,
- * so the secret is mirrored to a 0600 file on the same volume. This is the same
- * trust boundary as the credential-encryption key stored alongside it.
  */
 function writeSecretFile(secret: string): void {
   try {
@@ -97,11 +100,6 @@ function writeSecretFile(secret: string): void {
 
 /* ------------------------------------------------------------------ *
  * Seed configuration the container needs.
- *
- * Precedence: values already stored in data.json win for anything the operator
- * may have tuned through the UI (load balancing, log level, ...), so their
- * choices survive a restart. The management secret is the exception: the
- * environment is authoritative when it provides one.
  * ------------------------------------------------------------------ */
 async function reconcileConfig(): Promise<void> {
   const current = storeManager.getConfig() as Record<string, any>
@@ -115,10 +113,6 @@ async function reconcileConfig(): Promise<void> {
   if (current.loadBalanceStrategy !== CONFIG.loadBalanceStrategy) {
     updates.loadBalanceStrategy = CONFIG.loadBalanceStrategy
   }
-
-  // The proxy is started for the operator, and the UI's Dashboard reflects that.
-  // Letting upstream's own start path own it keeps PROXY_GET_STATUS / PROXY_START
-  // / PROXY_STOP operating on the same instance the container actually serves on.
   if (current.autoStartProxy !== true) updates.autoStartProxy = true
 
   if (CONFIG.enableApiKey) {
@@ -145,14 +139,11 @@ async function reconcileConfig(): Promise<void> {
 
   if (CONFIG.enableManagementApi) {
     const currentMgmt = current.managementApi || {}
-    // env > stored > freshly generated. Generated once, then persisted in
-    // data.json so restarts keep the same value and open consoles keep working.
     let effectiveSecret: string = ENV_SECRET || currentMgmt.managementApiSecret || ''
     if (!effectiveSecret) {
       effectiveSecret = randomBytes(32).toString('hex')
       console.log('[headless] generated a management secret for the UI')
     }
-
     if (
       currentMgmt.enableManagementApi !== true ||
       currentMgmt.managementApiSecret !== effectiveSecret
@@ -167,11 +158,9 @@ async function reconcileConfig(): Promise<void> {
         console.log('[headless] management secret updated from environment')
       }
     }
-
     writeSecretFile(effectiveSecret)
   }
 
-  // A headless process must never try to minimise into a tray that cannot exist.
   updates.minimizeToTray = false
 
   if (Object.keys(updates).length > 0) {
@@ -183,18 +172,38 @@ async function reconcileConfig(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
+ * Reporting the address users actually use
+ *
+ * The proxy is configured to bind the loopback port, and upstream sets the
+ * reported port/host from that bind. So the header badge, the management base
+ * URL and proxy:getStatus all advertised the internal port - a number that
+ * appears nowhere else and cannot be reached from a browser.
+ *
+ * Reported values are therefore overridden with the public ones. This is
+ * display metadata only: proxyStatusManager is read by the UI and by
+ * GET /health, and is not used to accept connections.
+ *
+ * Applied a few times because upstream sets them from inside the listen
+ * callback, which may run slightly after the handler is captured.
+ * ------------------------------------------------------------------ */
+function reportPublicAddress(): void {
+  try {
+    proxyStatusManager.setPort(CONFIG.publicPort)
+    proxyStatusManager.setHost(CONFIG.publicHost)
+  } catch (err) {
+    console.warn('[headless] could not set the reported proxy address:',
+      err instanceof Error ? err.message : err)
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Proxy startup
  *
- * READINESS IS THE CAPTURED HANDLER, NOT proxyStatusManager
- * ---------------------------------------------------------
- * A previous version polled getProxyStatus().isRunning and, when it never became
- * true, constructed a second ProxyServer as a fallback. That was actively
- * harmful: the second instance's start()/stop() cycle left SessionManager torn
- * down and proxyStatusManager reporting 'stopped' while requests were being
- * served - so /health said stopped and the UI showed the proxy as stopped.
- *
- * The signal that actually matters is the shim's captured request handler: if it
- * exists, upstream is serving and nothing else needs to happen.
+ * Readiness is the shim's captured handler, not proxyStatusManager: an earlier
+ * version polled the status and, when it did not become true, constructed a
+ * second ProxyServer. That was harmful - the second instance's start()/stop()
+ * cycle left SessionManager torn down and the manager reporting 'stopped' while
+ * requests were being served.
  * ------------------------------------------------------------------ */
 async function startProxy(): Promise<void> {
   const windowStub = (electron as any).__windowStub
@@ -217,18 +226,22 @@ async function startProxy(): Promise<void> {
     console.error(err instanceof Error ? err.stack : err)
   }
 
-  // registerIpcHandlers starts the proxy because autoStartProxy is set. Wait for
-  // the shim to capture the bind rather than inspecting proxy status.
   for (let i = 0; i < 80; i++) {
     if (captured()) {
       console.log('[headless] proxy serving via the captured handler')
+      reportPublicAddress()
+      // Upstream's listen callback may still run after this point.
+      setTimeout(reportPublicAddress, 500)
+      setTimeout(reportPublicAddress, 3000)
+      setTimeout(() => {
+        reportPublicAddress()
+        console.log(`[headless] advertising http://${CONFIG.publicHost}:${CONFIG.publicPort}`)
+      }, 6000)
       return
     }
     await sleep(250)
   }
 
-  // Nothing captured: the handlers could not start the proxy. This is the only
-  // case where starting one directly is correct.
   console.warn('[headless] no handler captured; starting the proxy directly')
   const server = new ProxyServer()
   const ok = await server.start(CONFIG.port, CONFIG.host)
@@ -236,6 +249,7 @@ async function startProxy(): Promise<void> {
     console.error(`[headless] FATAL: proxy failed to start on ${CONFIG.host}:${CONFIG.port}`)
     process.exit(1)
   }
+  reportPublicAddress()
 
   const shutdown = async (signal: string): Promise<void> => {
     console.log(`[headless] received ${signal}, shutting down`)
@@ -278,8 +292,6 @@ async function main(): Promise<void> {
     console.log('[headless] no accounts configured yet - open the web UI')
   }
 
-  // Flush upstream's buffered log writers on the way out so the data volume
-  // never keeps a partial write.
   let flushed = false
   const flush = (): void => {
     if (flushed) return

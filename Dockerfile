@@ -2,39 +2,19 @@
 # =============================================================================
 # 上游: https://github.com/wxs0625/Chat2API-WXS  (GPL-3.0)
 #
-# 这个镜像做什么
-# --------------
-# 上游是 Electron 桌面应用。本镜像把它整套跑在容器里，但只有**一个端口**：
-#
+# 只对外一个端口 8082：
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
-#   /v1、/health        -> 转发给回环上的网关
-#   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
+#   /v1、/health        -> 转发给网关
+#   /management/*      -> 改写成 /v0/management/* 后转发
 #
-# 关键点：界面是**复用上游自己编译出来的前端**，不是重画的。shim 把上游注册的
-# 每个 ipcMain.handle 记下来，前端服务把浏览器的调用派发进去，因此所有页面和
-# 操作逻辑都是上游原版，且随上游更新自动跟进。
+# CHAT2API_INTERNAL_PORT 是容器内网关自身的监听地址，**不会发布到宿主**。
+# 之所以需要它：上游 ProxyServer 只能绑定一个监听端口，而 8082 必须由前端
+# 服务占用（界面 + IPC 桥）。所以内部拆成两段，宿主只看见 8082。
 #
-# 四个关键机制
-# ------------
-# 1. shim/headless-entry.ts —— 作为额外的 Rollup 入口编进上游 bundle。
-#    上游打包会把主进程 tree-shake 成单个 bundle，外部没人引用的导出会被删掉；
-#    新增入口让打包器"看见" storeManager / ProxyServer / registerIpcHandlers。
-#
-# 2. shim/electron-shim.js —— 实现代理与 UI 桥都需要的那部分 Electron：
-#    safeStorage（AES-256-GCM）、app、net、process.resourcesPath，
-#    以及 ipcMain（登记而非空实现）、BrowserWindow 桩、事件总线。
-#
-# 3. 用 shim 替换 node_modules/electron —— 编译产物和 Rollup 拆出的 chunks/*.js
-#    都会 require('electron')，且分块位置随上游重构变化，换包是唯一稳定的拦截点。
-#
-# 4. webui/server.js —— 唯一对外端口：发上游前端、桥接 IPC 与事件、反代 API。
-#
-# 为什么必须分两个阶段
-# --------------------
-# `npm install` 会产生约 500MB 的层。若在同一阶段里事后删除无用依赖，
-# 那些文件仍留在镜像历史中（后续层只记录 whiteout 标记）。只有把裁剪放在
-# builder 阶段、再 COPY 裁剪后的结果，才能让死重不进最终镜像。
+# 源码获取
+# --------
+# 从 codeload 下载上游 tarball。（网络受限的环境请用 CI 构建好的 GHCR 镜像。）
 # =============================================================================
 
 ARG NODE_VERSION=20-alpine
@@ -110,6 +90,7 @@ COPY shim/electron-shim.js /build/stage/shim/electron-shim.js
 COPY shim/gateway.js /build/stage/shim/gateway.js
 COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
 COPY webui/server.js /build/stage/webui/server.js
+COPY webui/preload-bridge.js /build/stage/webui/preload-bridge.js
 
 RUN set -eux; \
     mkdir -p /build/stage/upstream; \
@@ -168,6 +149,7 @@ RUN set -eux; \
     test -f /app/upstream/renderer/index.html; \
     test -f /app/upstream/preload/index.js; \
     test -f /app/webui/server.js; \
+    test -f /app/webui/preload-bridge.js; \
     test -f /app/shim/gateway.js; \
     test -x /app/shim/entrypoint.sh; \
     chown -R node:node /app; \
@@ -181,6 +163,7 @@ ENV NODE_ENV=production \
     CHAT2API_BUNDLE=/app/upstream/main/headless.js \
     CHAT2API_RENDERER_DIR=/app/upstream/renderer \
     CHAT2API_PRELOAD_FILE=/app/upstream/preload/index.js \
+    CHAT2API_BRIDGE_FILE=/app/webui/preload-bridge.js \
     CHAT2API_PORT=8082 \
     CHAT2API_HOST=0.0.0.0 \
     CHAT2API_INTERNAL_PORT=18090 \
@@ -189,11 +172,9 @@ ENV NODE_ENV=production \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
-# 对外只暴露一个端口：上游界面和 API 共用
+# 唯一对外端口。CHAT2API_INTERNAL_PORT 只在容器内使用，不在此暴露。
 EXPOSE 8082
 
-# 不写 USER：entrypoint.sh 以 root 启动，先修正数据卷属主，再降权到 node 运行。
-# ENTRYPOINT 必须包含 entrypoint.sh，否则脚本根本不会被执行（CMD 只是它的参数）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
 

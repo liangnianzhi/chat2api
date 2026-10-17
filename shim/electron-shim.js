@@ -9,8 +9,7 @@
  *   proxy/captchaWindow.ts    BrowserWindow, session (Qwen captcha)
  *
  * This module provides those APIs for a plain Node process, plus the plumbing
- * that lets the real renderer drive the real main-process logic from a browser
- * (see "IPC bridge" below).
+ * that lets the real renderer drive the real main-process logic from a browser.
  */
 
 'use strict'
@@ -29,13 +28,10 @@ const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
  * Electron defines this; plain Node does not. The compiled bundle uses it to
  * locate the sha3 wasm it needs for DeepSeek/GLM request signing:
  *
- *   const wasmPath = app.isPackaged
- *     ? path.join(process.resourcesPath, "sha3_wasm_bg.7b9ca65ddd.wasm")
- *     : path.join(app.getAppPath(), "sha3_wasm_bg.7b9ca65ddd.wasm")
+ *   app.isPackaged ? path.join(process.resourcesPath, "sha3_wasm_bg...wasm") : ...
  *
- * With app.isPackaged = true and resourcesPath undefined that path.join throws
- * a TypeError - so signing would fail on the first real request. Point it at
- * the directory that actually holds the wasm (beside the bundle).
+ * With app.isPackaged = true and resourcesPath undefined that path.join throws,
+ * so signing would fail on the first real request.
  * ------------------------------------------------------------------ */
 const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR || path.join(__dirname, '..', 'upstream')
 if (typeof process.resourcesPath !== 'string') {
@@ -54,13 +50,10 @@ if (typeof process.resourcesPath !== 'string') {
 /* ------------------------------------------------------------------ *
  * safeStorage
  *
- * Electron's safeStorage encrypts via the OS keyring. A container has none, so
- * a random key is persisted on the data volume and AES-256-GCM is used instead.
- * The format is versioned so it stays self-describing.
- *
- * The key MUST stay stable across restarts: upstream's store.ts warns that if it
- * changes, the encrypted data.json is read as corrupt and the recovery path
- * silently wipes every account.
+ * No OS keyring in a container, so a random key is persisted on the data volume
+ * and AES-256-GCM is used. The key MUST stay stable across restarts: upstream's
+ * store.ts warns that if it changes, the encrypted data.json is read as corrupt
+ * and the recovery path silently wipes every account.
  * ------------------------------------------------------------------ */
 function loadOrCreateKey() {
   try {
@@ -96,15 +89,12 @@ const safeStorage = {
     const cipher = crypto.createCipheriv('aes-256-gcm', getKey(), iv)
     const enc = Buffer.concat([cipher.update(String(plainText), 'utf8'), cipher.final()])
     const tag = cipher.getAuthTag()
-    // v1:<iv>:<tag>:<ciphertext>  (all base64)
     const packed = `v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`
     return Buffer.from(packed, 'utf8')
   },
   decryptString(buffer) {
     const packed = Buffer.from(buffer).toString('utf8')
     if (!packed.startsWith('v1:')) {
-      // Not produced by us (plaintext, or an OS-keyring blob). Return as-is so
-      // upstream's own fallback logic keeps behaving predictably.
       return packed
     }
     const [, ivB64, tagB64, dataB64] = packed.split(':')
@@ -150,14 +140,11 @@ const app = {
   emit: () => false,
   commandLine: { appendSwitch: () => {}, appendArgument: () => {} },
   disableHardwareAcceleration: () => {},
-  // Used by lib/autoStart. There is no login session to register into, and the
-  // container's own restart policy is what keeps it running.
   setLoginItemSettings: () => {},
   getLoginItemSettings: () => ({ openAtLogin: false }),
   setAppUserModelId: () => {},
   setAboutPanelOptions: () => {},
   isPackaged: true,
-  // Upstream sets this before closing to distinguish quit from hide-to-tray.
   isQuitting: false,
 }
 
@@ -168,14 +155,41 @@ const app = {
  * `ipcMain.handle(channel, fn)`. Recording those handlers is what lets the real
  * renderer run in a browser: the front server dispatches HTTP calls into this
  * map, so every UI action lands on upstream's own implementation.
- *
- * The window stub stands in for the BrowserWindow that would normally exist.
- * Its webContents.send feeds the event bus (so status/config/OAuth events reach
- * the page), and it carries the window methods upstream calls on mainWindow.
  * ------------------------------------------------------------------ */
 const eventBus = new EventEmitter()
-// SSE listeners can be several; the UI may open more than one tab.
 eventBus.setMaxListeners(0)
+
+/**
+ * Opens requested before any client is listening.
+ *
+ * shell.openExternal is how upstream opens a login page, and OAuth adapters call
+ * it directly without anyone having registered a listener first - so a plain
+ * broadcast reached nobody and the browser never opened. These are replayed when
+ * the first subscriber appears.
+ */
+const pendingOpens = []
+let hasSubscribers = false
+
+function emitEvent(channel, args) {
+  if (channel === '__c2a:openExternal') {
+    if (hasSubscribers) {
+      eventBus.emit(channel, args)
+    } else {
+      pendingOpens.push(args)
+      console.log('[shim] queued browser open until the UI connects:', args[0])
+    }
+    return
+  }
+  eventBus.emit(channel, args)
+}
+
+function replayPendingOpens() {
+  if (hasSubscribers) return
+  hasSubscribers = true
+  if (pendingOpens.length === 0) return
+  console.log(`[shim] replaying ${pendingOpens.length} queued browser open(s)`)
+  for (const args of pendingOpens.splice(0)) eventBus.emit('__c2a:openExternal', args)
+}
 
 const ipcHandlers = new Map()
 const ipcListeners = new Map()
@@ -207,7 +221,7 @@ const ipcMain = {
 
 const windowStub = {
   webContents: {
-    send: (channel, ...args) => { eventBus.emit(channel, args) },
+    send: (channel, ...args) => { emitEvent(channel, args) },
     on: () => {}, once: () => {}, removeListener: () => {},
     executeJavaScript: async () => undefined,
     openDevTools: () => {}, closeDevTools: () => {},
@@ -235,15 +249,9 @@ const windowStub = {
   setMenu: () => {},
   on: () => {}, once: () => {}, removeListener: () => {},
 }
-windowStub.webContents.session = null
 
 /* ------------------------------------------------------------------ *
  * BrowserWindow / session
- *
- * Only optional GUI features use these (the Qwen captcha window). Constructing
- * a real window in a browser-hosted UI makes no sense, so it throws a message
- * that points at the manual path. getAllWindows() still returns the stub so
- * upstream's broadcast loops reach the event bus.
  * ------------------------------------------------------------------ */
 function unsupported(feature) {
   const err = new Error(
@@ -274,9 +282,6 @@ const session = {
 
 /* ------------------------------------------------------------------ *
  * net
- *
- * Chromium's net module backs the Perplexity adapter. Node's http/https is the
- * equivalent and honours a configured upstream proxy.
  * ------------------------------------------------------------------ */
 function buildNetRequest(options, callback) {
   const http = require('http')
@@ -361,9 +366,10 @@ const net = {
  * ------------------------------------------------------------------ */
 const shell = {
   openExternal: async (url) => {
-    // No desktop to open onto. Hand it to the UI, which opens a real tab.
+    // No desktop to open onto: hand it to the UI, which opens a real tab.
     console.log('[shim] shell.openExternal -> browser tab:', url)
-    eventBus.emit('__c2a:openExternal', [String(url)])
+    emitEvent('__c2a:openExternal', [String(url)])
+    return undefined
   },
   showItemInFolder: () => {},
   openPath: async () => '',
@@ -434,11 +440,12 @@ module.exports = {
   clipboard,
   powerMonitor,
 
-  // Not real Electron exports: these are the bridge plumbing, consumed by
-  // shim/gateway.js and webui/server.js, which run in this same process.
+  // Not real Electron exports: bridge plumbing consumed by shim/gateway.js and
+  // webui/server.js, which run in this same process.
   __isShim: true,
   __ipcHandlers: ipcHandlers,
   __ipcListeners: ipcListeners,
   __eventBus: eventBus,
   __windowStub: windowStub,
+  __replayPendingOpens: replayPendingOpens,
 }

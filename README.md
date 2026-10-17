@@ -9,6 +9,7 @@ OpenAI 兼容 API 网关 + Web 管理台，**不需要 Electron、不需要 Chro
 |---|---|
 | 镜像体积 | ~157 MB |
 | 常驻内存 | ~55 MB |
+| 端口 | **只要一个 8080**（管理台 + API 共用，和桌面版一致） |
 | 配置 | **零配置**：没有 .env，不需要任何密钥 |
 
 ---
@@ -20,21 +21,26 @@ mkdir -p data
 docker compose up -d
 ```
 
-浏览器打开 **`http://<主机IP>:8081`** —— 直接就是管理台，没有登录页。
+浏览器打开 **`http://<主机IP>:8080`**。
 
 就这三步。整个部署状态只有 `docker-compose.yml` 和 `data/` 两样东西。
 
 > 镜像默认是**私有**包，第一次拉取前需要先 `docker login ghcr.io`，
 > 或者在 GitHub 的 Packages 设置里把它改成 Public。
 
-## 访问入口
+## 一个端口上的三种东西
 
-| 入口 | 地址 | 用途 |
-|---|---|---|
-| **Web 管理台** | `http://<主机IP>:8081` | 配账号、API 密钥、代理参数 |
-| OpenAI API | `http://<主机IP>:8080/v1` | 给客户端调用 |
+| 路径 | 作用 |
+|---|---|
+| `GET /` | Web 管理台页面 |
+| `/v1/*` | OpenAI 兼容 API（给客户端调用） |
+| `/v0/management/*` | 管理 API（管理台自己调用） |
+| `/health` | 健康检查 |
 
-客户端接入：
+容器内部，网关只监听 `127.0.0.1:18080`，对外的单一入口是前端服务。
+所以宿主上只有一个端口需要发布。
+
+### 客户端接入
 
 ```python
 from openai import OpenAI
@@ -67,33 +73,30 @@ print(client.chat.completions.create(
 需手动取 token。其余提供商（DeepSeek / GLM / Kimi / MiniMax / Perplexity / Mimo）
 直接填 token/cookie，不受影响。
 
-## 关于「管理密钥」：为什么没有登录页，API 却还是要它
+## ⚠️ 一个端口带来的取舍
 
-上游的管理 API 强制要求一个密钥。这个密钥的唯一用途是保护
-`/v0/management/*`，而管理台正是它唯一的客户端。
+上游的管理 API 需要一个密钥，否则根本不会启用。而管理台就是它唯一的客户端，
+所以容器启动时会**自动生成**一个密钥、存进 `data/.chat2api/`（权限 600），
+由前端服务在转发时**在服务端附上**——因此打开网页不需要登录。
 
-于是这样处理：
+代价是：既然管理台和 API 共用一个端口，**能访问到这个端口的人就能管理账号**。
+对自用、局域网内的场景这是有意的取舍；如果你改变主意，有两条路：
 
-- 首次启动**自动生成**一个随机密钥，存进 `data/.chat2api/`（权限 600）
-- 管理台（反向代理）每次请求时**在服务端附上**它
-- 所以浏览器**不需要**登录，也不需要你看过这个密钥
+```yaml
+# 1) 只要 API，不要管理台
+environment:
+  CHAT2API_ENABLE_WEBUI: "false"
 
-但如果你**直连 8080** 调用管理 API，仍然需要它：
-
-```bash
-# 查看（只有你自己有文件权限）
-docker compose exec chat2api cat /data/.chat2api/.management-secret
-
-# 然后可用它调管理 API
-curl -H "Authorization: Bearer $(docker compose exec -T chat2api cat /data/.chat2api/.management-secret)" \
-  http://127.0.0.1:8080/v0/management/accounts
+# 2) 只绑定到本机 / 特定网卡
+ports:
+  - "127.0.0.1:8080:8080"
 ```
 
-这样管理台开着就能用，而 API 端口不必裸奔。如果你连这层也不想要，
-直接不发布 8080 端口即可（只在 compose 里保留 8081）。
+若需要直连管理 API（例如写脚本），可从容器里取密钥：
 
-> 想指定自己的密钥：在 compose 里加 `environment: { CHAT2API_MANAGEMENT_SECRET: xxx }`，
-> 环境变量优先于自动生成的值。
+```bash
+docker compose exec chat2api cat /data/.chat2api/.management-secret
+```
 
 ## 常用命令
 
@@ -117,9 +120,7 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 ## 数据卷权限
 
 **不需要手工 chown。** 容器启动时以 root 修正 `/data` 属主，然后降权到 uid 1000
-运行主进程（见 `shim/entrypoint.sh`）。
-
-所以宿主的 `mkdir -p data` 用任何用户都行。
+运行主进程（见 `shim/entrypoint.sh`）。所以宿主的 `mkdir -p data` 用任何用户都行。
 
 > 背景：群晖（Synology）的 btrfs 数据卷挂载带 `noacl,synoacl` 选项，走 DSM 自有 ACL，
 > 光靠 rwx 位不够，必须属主 uid 与容器内用户一致。把这一步放进 entrypoint
@@ -167,11 +168,11 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 编译产物和 Rollup 拆出的 `chunks/*.js` 都会 `require('electron')`，且分块位置会随上游
 重构变化。改编译产物需要每次重新验证；换包是一次性拦截所有调用点。
 
-**4. Web 管理台**
+**4. 单一入口 `webui/server.js`**
 
-`webui/server.js` 是一个零依赖 HTTP 服务：`GET /` 返回页面，`/v0/management/*` 同源反代理
-并注入密钥。白名单只放行 `/v0/management/` 与 `/health`，不会变成任意转发器。
-`shim/gateway.js` 作为 supervisor 同时拉起网关与管理台。
+一个零依赖 HTTP 服务拥有唯一对外端口：`GET /` 返回管理台页面，其余全部反代到回环上的
+网关，并在转发 `/v0/management/*` 时附上管理密钥。`shim/gateway.js` 作为 supervisor
+同时拉起网关与它（网关是主进程，退出则容器退出）。
 
 ## 上游更新与 CI
 
@@ -185,18 +186,14 @@ lint → 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 
 
 > 为什么要定时构建：本方案依赖上游三个「接缝」——`store.ts` 的 Electron 引用、
 > vite 配置的 `rollupOptions.input` 结构、启动流程仍在 `ipc/handlers.ts`。
-> 上游更新很快，定时构建能把「上游悄悄改坏了」变成一次失败的任务，
-> 而不是你某天 pull 到最新版才发现。
+> 上游更新很快，定时构建能把「上游悄悄改坏了」变成一次失败的任务。
 
 冒烟测试（`tests/smoke.sh`）覆盖：
 
-- 无头运行、镜像内无 Chromium/Xvfb、主进程已降权到 uid 1000
-- 数据卷属主故意设错，验证 entrypoint 能自愈
+- 无头运行、单端口布局、网关只绑回环、镜像内无 Chromium/Xvfb
+- 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权到 uid 1000
 - **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
-- 网关 `/health` 与 OpenAI 兼容路由
-- **管理台无任何凭据即返回 200**（服务端注入了密钥）、页面无登录框
-- **直连 8080 无凭据仍 401**，带密钥 200（会从容器里读出密钥来验）
-- 管理台代理白名单：`/v1/models` → 404
+- 同一端口上：管理台页面、`/v1/models`、`/v0/management/*`、`/health`
 - 添加账号 → 列表可见、凭证已掩码；生成客户端 API 密钥
 - AES-GCM 加解密往返、密文不含明文、篡改可检测
 - 加密密钥与管理密钥均持久化在数据卷；`data.json` 为密文
@@ -226,10 +223,10 @@ Dockerfile 会**直接失败报警**，不会静默产出坏镜像。
 │   ├── prune-deps.js           # 裁剪 node_modules（302MB → 3.8MB）
 │   ├── electron-shim.js        # Electron API 兼容层
 │   ├── entrypoint.sh           # 修正数据卷属主后降权运行
-│   └── gateway.js              # supervisor：起网关与管理台
+│   └── gateway.js              # supervisor：起网关与单一入口服务
 ├── webui/
 │   ├── index.html              # 管理台页面（单文件）
-│   └── server.js               # 零依赖 HTTP 服务 + 管理 API 反代理
+│   └── server.js               # 唯一对外端口：页面 + 反向代理
 ├── tests/smoke.sh
 └── .github/workflows/ci.yml
 ```
@@ -262,8 +259,8 @@ Dockerfile 会**直接失败报警**，不会静默产出坏镜像。
 **拉取镜像 403 / denied**
 GHCR 包默认私有。在 Packages → chat2api → Package settings 改为 Public，或先 `docker login ghcr.io`。
 
-**8081 打不开**
-`docker compose logs` 看日志。确认端口没被占用；管理台是容器内 8081。
+**8080 打不开**
+`docker compose logs` 看日志。确认端口没被占用。
 
 **`/health` 正常但调用报错**
 先去管理台「账号列表」点「校验」。若是 DeepSeek/GLM 报签名相关错误，

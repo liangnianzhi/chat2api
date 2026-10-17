@@ -6,13 +6,21 @@
  *
  *   store/store.ts            app, safeStorage, BrowserWindow
  *   proxy/adapters/perplexity net
- *   proxy/captchaWindow.ts    BrowserWindow, session (Qwen captcha)
+ *   proxy/captchaWindow.ts    BrowserWindow, session
  *
  * This module provides those APIs for a plain Node process, plus the plumbing
  * that lets the real renderer drive the real main-process logic from a browser.
  *
- * It also captures upstream's HTTP request handler so the front server can serve
- * the API without a second listening port. See "single port capture" below.
+ * IN-APP LOGIN
+ * ------------
+ * Upstream's "web login" creates a BrowserWindow, loads the provider site, and
+ * harvests the token from that window's localStorage/cookies. There is no window
+ * in a container, so the mechanism cannot be reproduced at all.
+ *
+ * Rather than let it fail (which is what made the button spin and error), the
+ * oauth:startInAppLogin channel is answered here with a result that sends the UI
+ * to a page the container *can* serve: webui/login.html, which tells the user
+ * which field to copy for their provider and stores what they paste back.
  */
 
 'use strict'
@@ -30,12 +38,7 @@ const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
  * process.resourcesPath
  *
  * Electron defines this; plain Node does not. The compiled bundle uses it to
- * locate the sha3 wasm it needs for DeepSeek/GLM request signing:
- *
- *   app.isPackaged ? path.join(process.resourcesPath, "sha3_wasm_bg...wasm") : ...
- *
- * With app.isPackaged = true and resourcesPath undefined that path.join throws,
- * so signing would fail on the first real request.
+ * locate the sha3 wasm it needs for DeepSeek/GLM request signing.
  * ------------------------------------------------------------------ */
 const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR || path.join(__dirname, '..', 'upstream')
 if (typeof process.resourcesPath !== 'string') {
@@ -93,14 +96,14 @@ const safeStorage = {
     const cipher = crypto.createCipheriv('aes-256-gcm', getKey(), iv)
     const enc = Buffer.concat([cipher.update(String(plainText), 'utf8'), cipher.final()])
     const tag = cipher.getAuthTag()
-    const packed = `v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`
-    return Buffer.from(packed, 'utf8')
+    return Buffer.from(
+      `v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`,
+      'utf8'
+    )
   },
   decryptString(buffer) {
     const packed = Buffer.from(buffer).toString('utf8')
-    if (!packed.startsWith('v1:')) {
-      return packed
-    }
+    if (!packed.startsWith('v1:')) return packed
     const [, ivB64, tagB64, dataB64] = packed.split(':')
     const decipher = crypto.createDecipheriv('aes-256-gcm', getKey(), Buffer.from(ivB64, 'base64'))
     decipher.setAuthTag(Buffer.from(tagB64, 'base64'))
@@ -114,28 +117,18 @@ const safeStorage = {
 /* ------------------------------------------------------------------ *
  * Single port capture
  *
- * Upstream's ProxyServer owns a Koa app and calls app.listen(port, host, cb),
- * which ends at http.Server.prototype.listen. Left alone that opens a second
- * port for the container.
+ * Upstream calls app.listen(), which ends at http.Server.prototype.listen. That
+ * bind is intercepted: the server's request listeners are replayed as the
+ * handler, and a stand-in handle is returned without opening a socket.
  *
- * CAPTURE POINT: http.Server.prototype.listen
+ * Patching Koa's prototype does not work - electron-vite inlines dependencies,
+ * so upstream's Koa is a private copy.
  *
- * Patching Koa's prototype does not work here. electron-vite inlines the app's
- * dependencies into one bundle, so the Koa class inside upstream's bundle is a
- * private copy - patching the Koa required from node_modules affects a different
- * object, and the interception silently never fires. Node's own http module is
- * shared, so patching its listen() is reliable.
- *
- * The first listen() on the default port is intercepted: a handler is built by
- * replaying the server's own request listeners, __httpHandler is published, and a
- * stand-in handle is returned that is already "listening". Upstream's callback is
- * invoked (it does proxyStatusManager bookkeeping there) and its request
- * listeners are suppressed on the real server so only one path serves requests.
- *
- * Returns to normal for any later listen(), so nothing else is affected.
+ * The caller's callback IS invoked, because upstream does its proxyStatusManager
+ * bookkeeping there.
  * ------------------------------------------------------------------ */
 const INTERCEPT_PORTS = new Set(
-  (process.env.CHAT2API_INTERCEPT_PORTS || '18090,18080,8080')
+  (process.env.CHAT2API_INTERCEPT_PORTS || '8082,18090,18080')
     .split(',')
     .map((p) => parseInt(p.trim(), 10))
     .filter((p) => Number.isFinite(p))
@@ -156,16 +149,12 @@ function installHttpCapture() {
 
   http.Server.prototype.listen = function capturedListen(...args) {
     const port = portFromArgs(args)
-    // Only the first bound port that the app itself asks for is captured.
     if (httpHandler || !INTERCEPT_PORTS.has(port)) {
       return originalListen.apply(this, args)
     }
 
     const server = this
-    // Node takes the callback last, in any position.
     const callback = args.find((a) => typeof a === 'function')
-    // Keep the server's request listeners so the handler can replay them; then
-    // detach them so the real server never sees traffic (it never binds anyway).
     const requestListeners = server.listeners('request').slice()
     for (const listener of requestListeners) server.removeListener('request', listener)
 
@@ -186,14 +175,9 @@ function installHttpCapture() {
     stand_in.ref = () => stand_in
     stand_in.unref = () => stand_in
 
-    // Upstream's own bookkeeping lives in this callback: proxyStatusManager
-    // .start() / setPort() / setHost() and a log entry. Skip it and the UI would
-    // report the proxy as stopped while it is in fact serving.
     if (callback) setTimeout(() => callback(), 0)
-
     return stand_in
   }
-
   http.Server.prototype.__c2aCaptured = true
 }
 
@@ -242,21 +226,10 @@ const app = {
 
 /* ------------------------------------------------------------------ *
  * IPC bridge
- *
- * Upstream registers every renderer-facing capability as
- * `ipcMain.handle(channel, fn)`. Recording those handlers is what lets the real
- * renderer run in a browser.
  * ------------------------------------------------------------------ */
 const eventBus = new EventEmitter()
 eventBus.setMaxListeners(0)
 
-/**
- * Opens requested before any client is listening.
- *
- * shell.openExternal is how upstream opens a login page, and OAuth adapters call
- * it directly without anyone having registered a listener first - so a plain
- * broadcast reached nobody and the browser never opened.
- */
 const pendingOpens = []
 let hasSubscribers = false
 
@@ -323,20 +296,10 @@ const windowStub = {
   isMaximized: () => false,
   isVisible: () => true,
   isFullScreen: () => false,
-  minimize: () => {},
-  maximize: () => {},
-  unmaximize: () => {},
-  restore: () => {},
-  hide: () => {},
-  show: () => {},
-  focus: () => {},
-  blur: () => {},
-  close: () => {},
-  destroy: () => {},
-  setTitle: () => {},
-  loadURL: async () => {},
-  loadFile: async () => {},
-  setMenu: () => {},
+  minimize: () => {}, maximize: () => {}, unmaximize: () => {}, restore: () => {},
+  hide: () => {}, show: () => {}, focus: () => {}, blur: () => {},
+  close: () => {}, destroy: () => {}, setTitle: () => {},
+  loadURL: async () => {}, loadFile: async () => {}, setMenu: () => {},
   on: () => {}, once: () => {}, removeListener: () => {},
 }
 
@@ -346,8 +309,7 @@ const windowStub = {
 function unsupported(feature) {
   const err = new Error(
     `[shim] ${feature} requires an Electron GUI, which this headless container `
-    + `does not have. Supply the account's token/cookie directly, or complete `
-    + `the verification in your own browser and paste the resulting cookie.`
+    + `does not have.`
   )
   err.code = 'ENOTSUP_HEADLESS'
   return err
@@ -420,8 +382,7 @@ function buildNetRequest(options, callback) {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
       res.on('end', () => {
-        const payload = Buffer.concat(chunks)
-        if (callback) callback(res.statusCode, res.statusMessage, res.headers, payload)
+        if (callback) callback(res.statusCode, res.statusMessage, res.headers, Buffer.concat(chunks))
       })
     }
   )
@@ -474,7 +435,7 @@ const dialog = {
  *
  * Inert rather than throwing: registerIpcHandlers calls
  * TrayManager.getInstance().updateProxyStatus() from the proxy start/stop
- * handlers, and a throw there would break the UI's own controls.
+ * handlers.
  * ------------------------------------------------------------------ */
 const nativeImage = {
   createFromPath: () => ({
@@ -512,6 +473,58 @@ const screen = {
 const clipboard = { writeText: () => {}, readText: () => '' }
 const powerMonitor = { on: () => {}, once: () => {}, off: () => {} }
 
+/* ------------------------------------------------------------------ *
+ * In-app login override
+ *
+ * Registered into this map before upstream claims the channel (upstream's
+ * registerIpcHandlers runs later and would otherwise win). The front server
+ * writes the handler into __ipcHandlers at startup - see "installLoginOverride".
+ *
+ * Return value: an OAuthResult the caller already knows how to read. `error` is
+ * shown verbatim by AddAccountDialog, so it carries the instruction.
+ * ------------------------------------------------------------------ */
+function loginPageUrl(providerType, providerId) {
+  const base = process.env.CHAT2API_PUBLIC_BASE_URL
+    || `http://${process.env.CHAT2API_PUBLIC_HOST || 'localhost'}:${process.env.CHAT2API_PORT || '8082'}`
+  const params = new URLSearchParams({ provider: providerType, providerId: providerId })
+  return `${base}/__login?${params.toString()}`
+}
+
+function installLoginOverride() {
+  const CHANNEL = 'oauth:startInAppLogin'
+  const handler = async (_event, data) => {
+    const providerType = (data && data.providerType) || (data && data.providerId) || ''
+    const providerId = (data && data.providerId) || providerType
+
+    const url = loginPageUrl(providerType, providerId)
+    console.log(`[shim] in-app login requested for ${providerType}; directing to ${url}`)
+
+    // Tell the page to open the login tab, then answer the caller.
+    emitEvent('__c2a:openExternal', [url])
+
+    return {
+      success: false,
+      providerId,
+      providerType,
+      error: '网页登录已改为「登录并粘贴凭证」：请在新打开的页面里完成登录后粘贴 token。',
+    }
+  }
+
+  // Override whatever upstream registers for this channel, now and later.
+  const originalSet = ipcHandlers.set.bind(ipcHandlers)
+  ipcHandlers.set = (channel, fn) => {
+    if (channel === CHANNEL) {
+      return originalSet(channel, handler)
+    }
+    return originalSet(channel, fn)
+  }
+  originalSet(CHANNEL, handler)
+
+  return { CHANNEL, handler }
+}
+
+installLoginOverride()
+
 module.exports = {
   app,
   safeStorage,
@@ -528,16 +541,12 @@ module.exports = {
   clipboard,
   powerMonitor,
 
-  // Not real Electron exports: bridge plumbing consumed by shim/gateway.js and
-  // webui/server.js, which run in this same process.
   __isShim: true,
   __ipcHandlers: ipcHandlers,
   __ipcListeners: ipcListeners,
   __eventBus: eventBus,
   __windowStub: windowStub,
   __replayPendingOpens: replayPendingOpens,
-  // The captured upstream HTTP handler, or null until the proxy binds. The front
-  // server polls this; when null it falls back to a loopback port.
   __httpHandler: () => httpHandler,
   __httpListening: () => httpListening,
 }

@@ -4,7 +4,8 @@
 **上游原版界面** + OpenAI 兼容 API 网关，全部跑在一个端口上，
 **不需要 Electron、不需要 Chromium、不需要 Xvfb**。
 
-镜像由 GitHub Actions 构建并发布：`ghcr.io/liangnianzhi/chat2api:latest`
+镜像由 GitHub Actions 构建并推送到 ghcr.io，**拉取走南京大学镜像站**：
+`ghcr.nju.edu.cn/liangnianzhi/chat2api:latest`
 
 | 项目 | 实测 |
 |---|---|
@@ -27,8 +28,8 @@ docker compose up -d
 
 整个部署状态只有 `docker-compose.yml` 和 `data/` 两样东西。
 
-> 镜像默认是**私有**包，第一次拉取前需要先 `docker login ghcr.io`，
-> 或者在 GitHub 的 Packages 设置里把它改成 Public。
+> **关于镜像源**：CI 推送到官方 `ghcr.io`（镜像站只代理下载，不接受上传），
+> 部署时从 `ghcr.nju.edu.cn` 拉取加速。compose 里已写好镜像站地址。
 
 ## 端口：只有一个
 
@@ -42,13 +43,16 @@ docker compose up -d
 | `/health` | 健康检查 |
 
 容器内也**只有一个监听端口**。上游的 `ProxyServer` 本来要自己 `listen` 一个端口，
-这里在 `http.Server.prototype.listen` 处把它拦下来，直接拿它注册的请求处理器
+这里在 `http.Server.prototype.listen` 处把它拦下来，直接用它注册的请求处理器
 在 8082 上处理——所以没有第二个端口、也没有回环转发。
+
+更关键的是：**配置里的端口也是 8082**。界面右上角显示的地址、管理 API 的基础
+地址、`proxy:getStatus` 的返回值，全都来自同一份配置，因此始终一致。
 
 启动日志会明确说明：
 
 ```
-[shim] captured the HTTP request handler on :18090 (single port)
+[shim] captured the HTTP request handler on :8082 (single port)
 [front] API: served in-process, no second port
 ```
 
@@ -79,23 +83,24 @@ curl http://127.0.0.1:8082/management/providers
 
 ## 关于「OAuth 登录」
 
-用之前需要知道：**上游的 OAuth 并不在应用内完成登录**。
-
-以 DeepSeek 为例，适配器的全部逻辑是：
+**上游的 OAuth 并不在应用内完成登录。** 以 DeepSeek 为例，适配器的全部逻辑是：
 
 ```ts
 await shell.openExternal('https://chat.deepseek.com')   // 打开浏览器
 return { success: false, error: '请在浏览器登录后手动填入 Token' }
 ```
 
-也就是说，那个按钮的作用**就是帮你打开厂商登录页**，剩下取 token、贴回界面由你手动完成。
+那个按钮的作用**就是帮你打开厂商登录页**，剩下取 token、贴回界面由你手动完成。
 
-这里修掉了一个真实缺陷：原来 `shell.openExternal` 只是把事件广播到
-SSE 通道，而 OAuth 调用时页面往往还没建立连接，**广播给了没人收**，
-点击后看起来毫无反应。现在：
+在浏览器里跑时，这一步有两个坑，都已处理：
 
-- 在调用栈内**同步打开新标签页**（仍属用户手势，不会被弹窗拦截）
-- 若确实没有订阅者在听，请求会**排队**，等界面连上后重放
+- **弹窗拦截**：上游从主进程发 `openExternal`，事件到达页面时早已不在用户手势内，
+  浏览器会拒绝打开。现在对可能打开浏览器的 IPC 通道（`*openExternal`、
+  `*startLogin` 等）在**点击的同步阶段先开一个空白标签页**，URL 到了再跳转。
+  万一仍被拦截，页面底部会显示一条横幅，把链接给你点。
+- **回环地址**：上游会把管理 API 地址拼成 `http://127.0.0.1:<port>/v0/management`，
+  在浏览器里这指向**你自己的电脑**，永远连不上。现在 `fetch`/`XHR` 会把这类
+  回环地址改写到当前 origin。
 
 **取 Token 的位置**：以 DeepSeek 为例，登录后在页面按 `F12` →
 **Application → Local Storage** → 复制 `userToken`，粘回界面的「添加账号」。
@@ -121,7 +126,6 @@ SSE 通道，而 OAuth 调用时页面往往还没建立连接，**广播给了�
   `contextBridge.exposeInMainWorld('electronAPI', ...)`，所以 channel 名全部与上游一致。
 - **shim 把 `ipcMain.handle` 登记下来**而不是当空函数，上游约 150 个 channel 原样可用。
 - **事件走 SSE**：代理状态、配置变更、OAuth 进度都能到页面。
-- **API 直接交给上游处理器**：见端口一节。
 
 **没有降级界面**：如果上游界面发不出来，直接返回错误说明原因，
 不会偷偷换成别的页面。API 始终可用。
@@ -156,12 +160,41 @@ ports:
 docker compose exec chat2api cat /data/.chat2api/.management-secret
 ```
 
+## 部署与升级
+
+容器由**群晖的容器管理器**根据 compose 创建，所以升级分两步：
+
+```bash
+cd /volume1/docker/chat2api
+
+./deploy.sh pull     # 1. 拉取新镜像
+                     # 2. 在群晖「容器管理器」里把这个容器「重置 / 重新创建」
+./deploy.sh wait     # 3. 等健康检查通过，并清理被替换下来的旧镜像
+```
+
+或者一条命令走完全程（它会停在第二步等你操作）：
+
+```bash
+./deploy.sh
+```
+
+其他子命令：
+
+```bash
+./deploy.sh status   # 容器状态、镜像、容器用的镜像 vs latest、悬空镜像
+./deploy.sh logs     # 跟踪日志
+```
+
+`deploy.sh` 的镜像地址**从 compose 读取**，两处不会不一致；也可用
+`CHAT2API_IMAGE=...` 覆盖。
+
+**为什么要手动重置**：`docker pull` 只换掉镜像，正在运行的容器仍用旧镜像；
+只有重建容器才会用上新镜像。这一步在群晖界面上做最稳妥。脚本会比对容器实际
+使用的镜像 ID，确认你真的重置过才继续——不会在旧容器还在跑时报成功。
+
 ## 常用命令
 
 ```bash
-docker compose pull          # 拉取最新镜像
-docker compose up -d         # 启动 / 应用变更
-docker compose down          # 停止
 docker compose logs -f       # 跟踪日志
 docker compose exec chat2api cat /app/UPSTREAM_INFO   # 当前上游版本
 
@@ -180,65 +213,40 @@ tar czf chat2api-data-$(date +%Y%m%d).tar.gz data
 > 背景：群晖的 btrfs 数据卷挂载带 `noacl,synoacl`，走 DSM 自有 ACL，
 > 光靠 rwx 位不够，必须属主 uid 与容器内用户一致。
 
-## 发布流程（重要）
+## 发布流程
 
-工作流**不会在每次 push 时构建** —— 一轮修改通常跨多个提交，每个都构建很浪费。
-
-```
-1. 把这一轮改动全部提交完
-2. Actions → build → Run workflow（选 main）
-3. 一次点击完成：构建 → 部署验证 → 冒烟测试 → 推送 latest
-```
-
-只有全部通过才会推送；任何一步失败都不会动 GHCR 上的 `latest`。
-
-**PR 会自动构建并测试（不推送）** —— 这是唯一保留的自动构建路径，用于合并前验证。
-
-### 关于 `sha256:` 是什么
-
-那不是标签，而是**镜像摘要（digest）**：内容寻址的哈希，不可变。
-
-早先一次运行会出现**两个** digest，因为旧流程构建了两次：先 `load` 一份供测试，
-再 `build --push` 完整重建一份用于推送。现在只构建一次，直接用测过的那份推送，
-所以**一次运行 = 一个 digest**。
-
-```bash
-docker image inspect ghcr.io/liangnianzhi/chat2api:latest \
-  --format '{{index .RepoDigests 0}}'
-```
-
-推荐固定到 digest 而不是 `latest`（更可复现）：
-
-```yaml
-image: ghcr.io/liangnianzhi/chat2api@sha256:...
-```
-
-### 流水线
+push 到 main 时自动构建、测试并推送 latest；PR 也会构建并测试（不推送）。
 
 ```
-lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 compose up → 冒烟测试 → 推送
+lint（shell + node 语法）→ 构建镜像 → 校验 compose → 真实 compose up
+   → 容器内冒烟测试 → 外部 HTTP 验证 → 端口上报断言 → 推送
 ```
+
+只用构建一次，推送的正是测过的那个镜像，所以**一次运行 = 一个 digest**。
 
 冒烟测试覆盖：
 
 - **只有一个发布端口**、API 在进程内处理、容器内无 18090 监听
-- 上游代理仍自报 running（证明 listen 回调被正确触发）
-- 无头运行、镜像内无 Chromium/Xvfb
+- **代理自报 running**，且**上报端口是 8082**（重启后仍成立）
 - 数据卷属主故意设错，验证 entrypoint 能自愈；主进程已降权
 - 时区为 Asia/Shanghai（TZ + `/etc/localtime` + `+0800` 偏移）
 - **wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会挂）
-- 上游界面已就绪、preload 桥注入、静态资源可访问、`/__ipc` 能派发真实 channel
-- **浏览器打开链路**（OAuth 依赖）+ 无订阅者时请求排队不丢失
+- 上游界面已就绪、preload 桥注入（含弹窗预开逻辑）、静态资源可访问
+- **浏览器打开链路**（OAuth 依赖）
 - **`/management` 与 `/v0/management` 状态码与结构一致**
 - 账号增删、凭证掩码、客户端 API 密钥
 - AES-GCM 加解密往返、密文不含明文、篡改可检测
-- 加密密钥与管理密钥均持久化；**重启后账号与密钥均不变**
+- 重启后账号与密钥均不变
 - 镜像体积预算
 
 本地也能跑：
 
 ```bash
-IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
+# 起临时容器跑完整套件
+IMAGE=ghcr.nju.edu.cn/liangnianzhi/chat2api:latest bash tests/smoke.sh
+
+# 或者只验证一个已部署的实例（纯 HTTP，不碰 docker）
+VERIFY_URL=http://192.168.1.10:8082 bash tests/smoke.sh
 ```
 
 ## 实现原理（代理部分）
@@ -262,13 +270,8 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 - `safeStorage`：**重启后必须仍能解密** —— 上游注释警告过，密钥一变，
   加密的 `data.json` 会被当作损坏并**静默清空所有账号**。
 - `process.resourcesPath`：Electron 专有属性，纯 Node 下是 `undefined`。
-  编译后的代码用它定位 sha3 wasm（DeepSeek/GLM 签名）：
-
-  ```js
-  app.isPackaged ? path.join(process.resourcesPath, "sha3_wasm_bg...wasm") : ...
-  ```
-
-  不补的话 `path.join(undefined, ...)` 直接抛 TypeError，**首个真实请求就会失败**。
+  编译后的代码用它定位 sha3 wasm（DeepSeek/GLM 签名），不补会抛 TypeError，
+  **首个真实请求就会失败**。
 - `ipcMain`：登记而非空实现（界面桥的基础）。
 - `Tray` / `Menu`：惰性空实现 —— `registerIpcHandlers` 会在代理启停时调
   `TrayManager.updateProxyStatus()`，抛错会弄坏界面自己的按钮。
@@ -278,23 +281,22 @@ IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 
 **4. 单端口捕获（`http.Server.prototype.listen`）**
 
-上游的 `ProxyServer` 要自己 `listen` 一个端口。拦 `Koa.prototype.listen` **不行**：
-`electron-vite` 把依赖内联进 bundle，上游用的 Koa 是**私有副本**，
-在外部 patch `node_modules/koa` 打的是另一个对象，拦截永远不会触发
-（实测 bundle 只用 Node 内置模块，从不 `require('koa')`）。
+拦 `Koa.prototype.listen` **不行**：`electron-vite` 把依赖内联进 bundle，
+上游用的 Koa 是**私有副本**，在外部 patch `node_modules/koa` 打的是另一个对象，
+拦截永远不会触发。Node 的 `http` 模块是共享的，所以改在这里拦：
 
-Node 的 `http` 模块是共享的，所以改在 `http.Server.prototype.listen` 拦截：
-
-- 摘下该 server 已有的 `request` 监听器，组成一个处理器发布为 `__httpHandler`
+- 摘下该 server 已有的 `request` 监听器，组成处理器发布为 `__httpHandler`
 - 返回一个「已监听」的替身对象（不绑 socket）
-- **调用上游传入的 callback** —— `proxyStatusManager.start()`/`setPort()` 都在里面，
-  不调用的话界面会显示代理「已停止」而实际在服务
+- **调用上游传入的 callback** —— `proxyStatusManager.start()`/`setPort()` 都在里面
+
+前端服务会**等捕获完成后**才启动（而不是固定延时），避免它自己的监听被误捕获。
 
 ## 目录结构
 
 ```
 .
 ├── docker-compose.yml          # 全部部署配置
+├── deploy.sh                   # 拉取镜像 + 等重置 + 清理旧镜像
 ├── Dockerfile                  # CI 用的多阶段构建
 ├── .offline.Dockerfile         # 备选：从预编译目录组装
 ├── shim/
@@ -306,7 +308,7 @@ Node 的 `http` 模块是共享的，所以改在 `http.Server.prototype.listen`
 │   └── gateway.js              # supervisor：装 shim、起网关与前端服务
 ├── webui/
 │   ├── server.js               # 唯一对外端口：前端 + IPC 桥 + 直连 API
-│   └── preload-bridge.js       # 浏览器侧的 preload 垫片
+│   └── preload-bridge.js       # 浏览器侧 preload 垫片
 ├── tests/smoke.sh
 └── .github/workflows/ci.yml
 ```
@@ -326,19 +328,21 @@ Node 的 `http` 模块是共享的，所以改在 `http.Server.prototype.listen`
 
 ## 常见问题
 
-**拉取镜像 403 / denied / 卡住**
-GHCR 包默认私有，匿名拉取会被卡住。改为 Public，或先 `docker login ghcr.io`。
+**拉取镜像失败**
+先确认镜像站地址可用；必要时改回官方 `ghcr.io/liangnianzhi/chat2api:latest`
+（私有包需 `docker login ghcr.io`）。
 
-**改了代码但 GHCR 上还是旧的**
-推送只在手动触发时发生。Actions → build → Run workflow。
+**界面右上角端口不对**
+应为 `:8082`。若显示别的数字，说明镜像是旧版——`./deploy.sh pull` 后在群晖里
+重置容器。
 
 **点 OAuth 登录没反应**
-确认镜像是修好 openExternal 的版本。另外上游的 OAuth 只是「打开浏览器登录页」，
+确认镜像是含弹窗预开逻辑的版本。另外上游的 OAuth 只是「打开浏览器登录页」，
 登录后仍需手动贴 token。
 
 **界面打不开但 /v1 正常**
 看日志里有没有 `captured the HTTP request handler` 和
-`API: served in-process` —— 缺前者说明上游改了监听方式。
+`proxy handler captured; starting the front server`。
 
 ## 许可
 

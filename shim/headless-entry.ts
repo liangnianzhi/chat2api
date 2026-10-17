@@ -10,7 +10,7 @@
  *
  * Adding this file as an extra Rollup input makes the bundler see real imports
  * of both and keep them. The result is out/main/headless.js: a self-contained
- * bundle that starts the proxy with no Electron GUI.
+ * bundle that runs the app with no Electron GUI.
  *
  * It is copied into src/main/ at image build time and never touches upstream
  * behaviour: the normal GUI entry (index.ts) is unchanged.
@@ -19,6 +19,8 @@
 import { randomBytes } from 'crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
+
+import * as electron from 'electron'
 
 import { storeManager } from './store/store'
 import { ProxyServer } from './proxy/server'
@@ -39,6 +41,10 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 const WEBUI_ENABLED = envBool('CHAT2API_ENABLE_WEBUI', true)
 const ENV_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
 
@@ -54,9 +60,9 @@ const DATA_DIR = process.env.CHAT2API_HOME || join(process.env.HOME || '/data', 
 const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
-  // The gateway itself listens on loopback only. The front server owns the
-  // single public port and proxies here, so the UI and the API share one
-  // address - the way the desktop app presented them.
+  // The proxy listens on loopback only. The front server owns the single public
+  // port and proxies here, so the UI and the API share one address - the way the
+  // desktop app presented them.
   port: envInt('CHAT2API_INTERNAL_PORT', 18080),
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   apiKey: process.env.CHAT2API_API_KEY || '',
@@ -69,13 +75,13 @@ const CONFIG = {
   managementSecret: ENV_SECRET,
 }
 
-console.log('[headless] Chat2API gateway starting')
+console.log('[headless] Chat2API starting')
 console.log('[headless] gateway listening on', `${CONFIG.host}:${CONFIG.port}`)
 
 /**
  * Publish the effective management secret where the front server can read it.
  *
- * The console runs in a separate process and cannot decrypt data.json, so the
+ * The console runs outside this process and cannot decrypt data.json, so the
  * secret is mirrored to a 0600 file on the same volume. This is the same trust
  * boundary as the credential-encryption key stored alongside it.
  */
@@ -94,17 +100,14 @@ function writeSecretFile(secret: string): void {
  * Seed configuration the container needs.
  *
  * Precedence: values already stored in data.json win for anything the operator
- * may have tuned through the console (load balancing, log level, ...), so their
+ * may have tuned through the UI (load balancing, log level, ...), so their
  * choices survive a restart. The management secret is the exception: the
- * environment is authoritative when it provides one, so rotating it in the
- * compose file takes effect on restart.
+ * environment is authoritative when it provides one.
  * ------------------------------------------------------------------ */
 async function reconcileConfig(): Promise<void> {
   const current = storeManager.getConfig() as Record<string, any>
   const updates: Record<string, any> = {}
 
-  // Stored settings point at the public port only if nothing else set them;
-  // internally the gateway moves to the loopback port the front server proxies.
   if (current.proxyPort !== CONFIG.port) updates.proxyPort = CONFIG.port
   if (current.proxyHost !== CONFIG.host) updates.proxyHost = CONFIG.host
   if (current.enableCors !== CONFIG.enableCors) updates.enableCors = CONFIG.enableCors
@@ -113,6 +116,11 @@ async function reconcileConfig(): Promise<void> {
   if (current.loadBalanceStrategy !== CONFIG.loadBalanceStrategy) {
     updates.loadBalanceStrategy = CONFIG.loadBalanceStrategy
   }
+
+  // The proxy is started for the operator, and the UI's Dashboard reflects that.
+  // Letting upstream's own start path own it keeps PROXY_GET_STATUS / PROXY_START
+  // / PROXY_STOP operating on the same instance the container actually serves on.
+  if (current.autoStartProxy !== true) updates.autoStartProxy = true
 
   if (CONFIG.enableApiKey) {
     updates.enableApiKey = true
@@ -176,18 +184,44 @@ async function reconcileConfig(): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ *
- * Boot
+ * Proxy startup
+ *
+ * Preferred path: register upstream's IPC handlers, which both wires the whole
+ * renderer-facing API surface and starts the proxy (autoStartProxy above). The
+ * fallback exists because those handlers pull in tray / updater / oauth code; if
+ * any of it cannot initialise headlessly we still serve the API, just without
+ * the UI bridge.
  * ------------------------------------------------------------------ */
-async function main(): Promise<void> {
+interface ProxyStatusLike { isRunning: boolean; port?: number; host?: string }
+
+async function startProxy(): Promise<void> {
+  const windowStub = (electron as any).__windowStub
+  let upstreamStatus: (() => ProxyStatusLike) | null = null
+
   try {
-    await storeManager.initialize()
+    const mod = await import('./ipc/handlers')
+    await mod.registerIpcHandlers(windowStub)
+    upstreamStatus = mod.getProxyStatus as () => ProxyStatusLike
+    console.log('[headless] IPC bridge registered - the UI can drive this process')
   } catch (err) {
-    console.error('[headless] FATAL: store initialization failed')
+    console.error('[headless] IPC bridge unavailable, serving the API without it:')
     console.error(err instanceof Error ? err.stack : err)
-    process.exit(1)
   }
 
-  await reconcileConfig()
+  if (upstreamStatus) {
+    for (let i = 0; i < 40; i++) {
+      try {
+        if (upstreamStatus().isRunning) {
+          console.log('[headless] proxy started via upstream handler')
+          return
+        }
+      } catch {
+        break
+      }
+      await sleep(250)
+    }
+    console.warn('[headless] upstream did not report a running proxy; starting directly')
+  }
 
   const server = new ProxyServer()
   const ok = await server.start(CONFIG.port, CONFIG.host)
@@ -199,17 +233,8 @@ async function main(): Promise<void> {
   const providers = storeManager.getProviders()
   const accounts = storeManager.getAccounts()
   console.log(`[headless] ready - providers: ${providers.length}, accounts: ${accounts.length}`)
-  if (accounts.length === 0) {
-    console.log('[headless] no accounts configured yet.')
-    console.log('[headless] open the web console to add them')
-  }
 
-  /* Graceful shutdown: flush upstream's buffered log writers so the data
-   * volume never keeps a partial write. */
-  let shuttingDown = false
   const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) return
-    shuttingDown = true
     console.log(`[headless] received ${signal}, shutting down`)
     try {
       await server.stop()
@@ -223,10 +248,49 @@ async function main(): Promise<void> {
     }
     process.exit(0)
   }
-
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
     process.on(sig, () => { void shutdown(sig) })
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Boot
+ * ------------------------------------------------------------------ */
+async function main(): Promise<void> {
+  try {
+    await storeManager.initialize()
+  } catch (err) {
+    console.error('[headless] FATAL: store initialization failed')
+    console.error(err instanceof Error ? err.stack : err)
+    process.exit(1)
+  }
+
+  await reconcileConfig()
+  await startProxy()
+
+  const providers = storeManager.getProviders()
+  const accounts = storeManager.getAccounts()
+  console.log(`[headless] ready - providers: ${providers.length}, accounts: ${accounts.length}`)
+  if (accounts.length === 0) {
+    console.log('[headless] no accounts configured yet - open the web console')
+  }
+
+  // Flush upstream's buffered log writers on the way out so the data volume
+  // never keeps a partial write.
+  let flushed = false
+  const flush = (): void => {
+    if (flushed) return
+    flushed = true
+    try {
+      storeManager.flushPendingWrites()
+    } catch (err) {
+      console.warn('[headless] error flushing writes:', err instanceof Error ? err.message : err)
+    }
+  }
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+    process.on(sig, () => { flush(); process.exit(0) })
+  }
+  process.on('exit', flush)
 
   process.on('uncaughtException', (err) => {
     console.error('[headless] uncaught exception:', err instanceof Error ? err.stack : err)

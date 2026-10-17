@@ -43,7 +43,7 @@ const WEBUI_ENABLED = envBool('CHAT2API_ENABLE_WEBUI', true)
 const ENV_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
 
 /**
- * The web console drives the management API, so that API must be on whenever the
+ * The console drives the management API, so that API must be on whenever the
  * console is. Requiring a second flag (and a secret) just to get a working UI is
  * friction with no benefit: the secret is generated automatically below.
  */
@@ -54,9 +54,11 @@ const DATA_DIR = process.env.CHAT2API_HOME || join(process.env.HOME || '/data', 
 const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
-  port: envInt('CHAT2API_PORT', 8080),
-  // 0.0.0.0 is required for the port to be reachable outside the container.
-  host: process.env.CHAT2API_HOST || '0.0.0.0',
+  // The gateway itself listens on loopback only. The front server owns the
+  // single public port and proxies here, so the UI and the API share one
+  // address - the way the desktop app presented them.
+  port: envInt('CHAT2API_INTERNAL_PORT', 18080),
+  host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   apiKey: process.env.CHAT2API_API_KEY || '',
   enableApiKey: envBool('CHAT2API_ENABLE_API_KEY', Boolean(process.env.CHAT2API_API_KEY)),
   logLevel: process.env.CHAT2API_LOG_LEVEL || 'info',
@@ -68,13 +70,13 @@ const CONFIG = {
 }
 
 console.log('[headless] Chat2API gateway starting')
-console.log('[headless] listening target:', `${CONFIG.host}:${CONFIG.port}`)
+console.log('[headless] gateway listening on', `${CONFIG.host}:${CONFIG.port}`)
 
 /**
- * Publish the effective management secret where the console can read it.
+ * Publish the effective management secret where the front server can read it.
  *
- * The console is a separate process and cannot decrypt data.json, so the secret
- * is mirrored to a 0600 file on the same volume. This is the same trust
+ * The console runs in a separate process and cannot decrypt data.json, so the
+ * secret is mirrored to a 0600 file on the same volume. This is the same trust
  * boundary as the credential-encryption key stored alongside it.
  */
 function writeSecretFile(secret: string): void {
@@ -101,6 +103,8 @@ async function reconcileConfig(): Promise<void> {
   const current = storeManager.getConfig() as Record<string, any>
   const updates: Record<string, any> = {}
 
+  // Stored settings point at the public port only if nothing else set them;
+  // internally the gateway moves to the loopback port the front server proxies.
   if (current.proxyPort !== CONFIG.port) updates.proxyPort = CONFIG.port
   if (current.proxyHost !== CONFIG.host) updates.proxyHost = CONFIG.host
   if (current.enableCors !== CONFIG.enableCors) updates.enableCors = CONFIG.enableCors

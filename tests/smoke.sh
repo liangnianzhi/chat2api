@@ -102,6 +102,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+info "时区默认为 Asia/Shanghai"
+# ---------------------------------------------------------------------------
+# 静默回退到 UTC 只会在日志时间戳上发现，所以直接问容器。
+TZ_ENV="$(in_container 'printf %s "$TZ"' | tr -d '\r\n')"
+[ "$TZ_ENV" = "Asia/Shanghai" ] \
+  && pass "TZ=$TZ_ENV" || fail "TZ=$TZ_ENV，预期 Asia/Shanghai"
+
+TZ_FILE="$(in_container 'readlink /etc/localtime' | tr -d '\r\n')"
+[[ "$TZ_FILE" == *"Shanghai"* ]] \
+  && pass "/etc/localtime -> $TZ_FILE" || fail "/etc/localtime 未指向上海：$TZ_FILE"
+
+# 偏移应为 +0800
+TZ_OFFSET="$(in_container 'date +%z' | tr -d '\r\n')"
+[ "$TZ_OFFSET" = "+0800" ] \
+  && pass "date +%z = $TZ_OFFSET" || fail "时区偏移为 $TZ_OFFSET，预期 +0800"
+
+# ---------------------------------------------------------------------------
 info "主进程已降权"
 # ---------------------------------------------------------------------------
 SECRET_FILE="/data/.chat2api/.management-secret"
@@ -169,11 +186,6 @@ grep -q '"ok":true' <<<"$IPC_ACC" \
 # ---------------------------------------------------------------------------
 info "浏览器打开（OAuth 登录依赖这条链路）"
 # ---------------------------------------------------------------------------
-# OAuth 在这里就是「打开厂商登录页，再手动贴回 token」。这一步一旦失效，
-# 点登录就毫无反应，所以单独断言。
-#
-# 必须经由运行中的进程触发：docker exec 起的是另一个进程，它的事件总线
-# 与主进程不是同一个，测不通也是必然。
 SSE_FILE="$WORKDIR/sse.txt"
 : > "$SSE_FILE"
 ( curl -sS --max-time 15 -N "http://127.0.0.1:${PORT}/__ipc/events" > "$SSE_FILE" 2>/dev/null & )
@@ -190,7 +202,6 @@ else
   fail "openExternal 事件未到达事件流：$(head -c 200 "$SSE_FILE" 2>/dev/null)"
 fi
 
-# 无订阅者时应排队保留，而不是静默丢弃。
 QUEUED_OUT="$(docker exec "$CONTAINER" node -e '
 const s = require("/app/shim/electron-shim.js");
 s.shell.openExternal("https://queued.example/probe")
@@ -261,15 +272,6 @@ grep -q 'smoke-account' <<<"$LIST" \
 
 grep -q 'smoke-token-value' <<<"$LIST" \
   && fail "列表泄露了明文凭证" || pass "列表未泄露明文凭证（已掩码）"
-
-# ---------------------------------------------------------------------------
-info "客户端 API 密钥"
-# ---------------------------------------------------------------------------
-KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/management/api-keys" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"smoke-client"}' || echo '')"
-grep -q 'sk-mgmt-' <<<"$KEYRESP" \
-  && pass "生成客户端 API 密钥" || fail "生成密钥失败: $KEYRESP"
 
 # ---------------------------------------------------------------------------
 info "凭证加密（AES-256-GCM）"

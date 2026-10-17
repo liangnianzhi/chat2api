@@ -22,8 +22,14 @@ SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-250}"
 WORKDIR="$(mktemp -d)"
 
 FAILED=0
+FAILURES=""
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
-fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAILED=1; }
+fail() {
+  printf '  \033[31mFAIL\033[0m  %s\n' "$*"
+  FAILED=1
+  FAILURES="${FAILURES}${FAILURES:+
+}  - $*"
+}
 info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 cleanup() {
@@ -63,9 +69,13 @@ info "启动与健康检查"
 if wait_ready; then
   pass "容器在 120s 内就绪"
 else
-  fail "容器未就绪，日志如下："
-  docker logs --tail 60 "$CONTAINER" 2>&1 | sed 's/^/      /'
-  echo; echo "SMOKE TEST FAILED"; exit 1
+  fail "容器未就绪"
+  echo "---- 容器日志 ----"
+  docker logs --tail 80 "$CONTAINER" 2>&1 | sed 's/^/      /'
+  echo
+  printf '\n\033[31m❌ SMOKE TEST FAILED（容器未就绪，提前退出）\033[0m\n'
+  printf '失败项：\n%s\n' "$FAILURES"
+  exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -93,18 +103,19 @@ info "上游 wasm 依赖（DeepSeek/GLM 签名）"
 # 编译后的 bundle 通过 process.resourcesPath 定位 sha3 wasm；该属性只在 Electron
 # 中存在，纯 Node 下为 undefined，path.join 会直接抛错。此项确保 shim 已定义它
 # 且 wasm 确实在对应目录里，否则首个真实 DeepSeek 请求才会暴露问题。
-if docker exec "$CONTAINER" node -e '
+WASM_OUT="$(docker exec "$CONTAINER" node -e '
 require("/app/shim/electron-shim.js");
 const fs = require("fs"), path = require("path");
 const p = process.resourcesPath;
-if (typeof p !== "string") { console.error("resourcesPath is not a string"); process.exit(1) }
+if (typeof p !== "string") { console.error("resourcesPath is not a string: " + p); process.exit(1) }
 const f = path.join(p, "sha3_wasm_bg.7b9ca65ddd.wasm");
 if (!fs.existsSync(f)) { console.error("wasm missing at " + f); process.exit(1) }
 console.log("ok");
-' >/dev/null 2>&1; then
+' 2>&1)"
+if grep -q '^ok$' <<<"$WASM_OUT"; then
   pass "process.resourcesPath 可用且能定位 wasm"
 else
-  fail "wasm 路径解析失败（DeepSeek/GLM 签名会报错）"
+  fail "wasm 路径解析失败：$WASM_OUT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -178,7 +189,7 @@ grep -q 'sk-mgmt-' <<<"$KEYRESP" \
 # ---------------------------------------------------------------------------
 info "凭证加密（AES-256-GCM）"
 # ---------------------------------------------------------------------------
-if docker exec "$CONTAINER" node -e '
+CRYPTO_OUT="$(docker exec "$CONTAINER" node -e '
 const s = require("/app/shim/electron-shim.js");
 const secret = "roundtrip-probe-value";
 if (s.safeStorage.isEncryptionAvailable() !== true) { console.error("not available"); process.exit(1) }
@@ -190,10 +201,11 @@ try {
   console.error("tamper not detected"); process.exit(1);
 } catch {}
 console.log("ok");
-' >/dev/null 2>&1; then
+' 2>&1)"
+if grep -q '^ok$' <<<"$CRYPTO_OUT"; then
   pass "加解密往返、无明文泄露、篡改可检测"
 else
-  fail "凭证加密自检失败"
+  fail "凭证加密自检失败：$CRYPTO_OUT"
 fi
 
 # 密钥必须落在数据卷上，否则重启后无法解密旧数据
@@ -204,11 +216,12 @@ else
 fi
 
 # data.json 必须是密文。用 JSON.parse 判定而非字节启发式，否则二进制数据可能误判。
-if docker exec "$CONTAINER" node -e '
+DATAJSON_OUT="$(docker exec "$CONTAINER" node -e '
 const fs = require("fs");
 try { JSON.parse(fs.readFileSync("/data/.chat2api/data.json", "utf8")); process.exit(1) }
 catch { process.exit(0) }
-' >/dev/null 2>&1; then
+' 2>&1)"
+if [ -z "$DATAJSON_OUT" ]; then
   pass "data.json 为密文"
 else
   fail "data.json 可直接解析为 JSON（应为密文）"
@@ -258,6 +271,7 @@ if [ "$FAILED" = 0 ]; then
   exit 0
 else
   printf '\n\033[31m❌ SMOKE TEST FAILED\033[0m\n'
+  printf '失败项：\n%s\n' "$FAILURES"
   echo "---- 容器日志 ----"
   docker logs --tail 60 "$CONTAINER" 2>&1 || true
   exit 1

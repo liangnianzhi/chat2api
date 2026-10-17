@@ -2,17 +2,17 @@
 #
 # Smoke test for the Chat2API gateway container.
 #
-# Runs against an already-started container and reports PASS/FAIL per check.
-# Used by .github/workflows/ci.yml, and runnable locally:
+# Runs against an already-started or freshly created container and reports
+# PASS/FAIL per check. Used by .github/workflows/ci.yml, and runnable locally:
 #
-#   IMAGE=chat2api-gateway:latest ./tests/smoke.sh
+#   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
 # It intentionally avoids jq and other extras: GitHub runners have them, minimal
 # hosts may not, and grep is enough for the shapes being asserted.
 
 set -uo pipefail
 
-IMAGE="${IMAGE:-chat2api-gateway:latest}"
+IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
 CONTAINER="${CONTAINER:-chat2api-smoke}"
 API_PORT="${API_PORT:-18080}"
 UI_PORT="${UI_PORT:-18081}"
@@ -228,11 +228,11 @@ else
 fi
 
 # data.json 必须是密文。用 JSON.parse 判定而非字节启发式，否则二进制数据可能误判。
-DATAJSON_OUT="$(docker exec "$CONTAINER" node -e '
+DATAJSON_OUT="$(docker exec "$CONTAINER" test -s /data/.chat2api/data.json && docker exec "$CONTAINER" node -e '
 const fs = require("fs");
 try { JSON.parse(fs.readFileSync("/data/.chat2api/data.json", "utf8")); process.exit(1) }
 catch { process.exit(0) }
-' 2>&1)"
+' 2>&1 || true)"
 if [ -z "$DATAJSON_OUT" ]; then
   pass "data.json 为密文"
 else

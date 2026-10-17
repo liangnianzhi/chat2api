@@ -5,10 +5,16 @@
 
 **不需要 Electron、不需要 Chromium、不需要 Xvfb，也不需要图形界面。**
 
+镜像由 GitHub Actions 构建并发布到 GHCR，使用方直接拉取即可：
+
+```
+ghcr.io/liangnianzhi/chat2api:latest
+```
+
 | 项目 | 实测 |
 |---|---|
-| 镜像体积 | **157 MB** |
-| 常驻内存 | **约 55 MB**（网关 + 管理台） |
+| 镜像体积 | ~157–181 MB |
+| 常驻内存 | ~55 MB（网关 + 管理台） |
 | 运行内容 | 13.8 MB（依赖裁剪到 3.8 MB） |
 | 容器测试 | GitHub Actions（见第六节） |
 
@@ -25,7 +31,7 @@ IPC 初始化流程里启动，没有独立服务端入口，也没有官方 Doc
 | 方案 | 镜像大小 | 常驻内存 | 额外依赖 |
 |---|---|---|---|
 | 无头 Electron + Xvfb | ~1 GB | ~350–500 MB | Chromium、Xvfb、字体、各类 .so |
-| **本方案（原生 Node 网关）** | **157 MB** | **~55 MB** | 无 |
+| **本方案（原生 Node 网关）** | **~157 MB** | **~55 MB** | 无 |
 
 对一个纯粹的协议转换网关来说，前者明显不合理。
 
@@ -67,6 +73,15 @@ IPC 初始化流程里启动，没有独立服务端入口，也没有官方 Doc
   `data/.chat2api/.safe-storage-key`。**重启后仍能解密**——这点很关键，
   否则上游会把账号判定为损坏并清空（上游 `getEncryptionKey()` 的注释专门警告过这个坑）。
 - **`app`**：提供 `getVersion`/`getPath` 等，数据目录跟随 `$HOME`。
+- **`process.resourcesPath`**：Electron 专有属性，纯 Node 下为 `undefined`。
+  编译后的代码用它定位 sha3 wasm（DeepSeek/GLM 请求签名用）：
+
+  ```js
+  app.isPackaged ? path.join(process.resourcesPath, "sha3_wasm_bg...wasm") : ...
+  ```
+
+  不补的话 `path.join(undefined, ...)` 会直接抛 TypeError，**首个真实
+  DeepSeek/GLM 请求就会失败**。shim 会把它指向 wasm 实际所在目录。
 - **`net`**：用 Node `http`/`https` 实现，支持 `HTTPS_PROXY`。
 - **`BrowserWindow` / `Tray` / `session`**：明确抛错而不是静默失败，
   让 GUI-only 功能（Qwen 验证码窗、托盘）在无头环境下有可诊断的报错。
@@ -99,7 +114,11 @@ IPC 初始化流程里启动，没有独立服务端入口，也没有官方 Doc
 `shim/gateway.js` 作为 supervisor 同时拉起网关与管理台：
 网关是主进程（退出则容器退出），管理台是尽力而为（挂了不影响 API）。
 
+设置 `CHAT2API_MANAGEMENT_SECRET` 即**自动启用管理 API**，不需要额外开关。
+
 ## 三、快速开始
+
+镜像已经发布在 GHCR，本地不需要构建：
 
 ```bash
 git clone https://github.com/liangnianzhi/chat2api.git
@@ -110,12 +129,19 @@ cp .env.example .env
 ./manage.sh keygen        # 生成管理密钥
 vi .env                   # 把密钥填到 CHAT2API_MANAGEMENT_SECRET
 
-# 2) 启动（首次会构建，GitHub runner 上约 3-5 分钟；NAS 上可能 40 分钟以上）
+# 2) 启动（缺失时自动拉取镜像）
 ./manage.sh up
 
 # 3) 查看状态与自测
 ./manage.sh status
 ./manage.sh test
+```
+
+也可以不用脚本：
+
+```bash
+docker compose pull
+docker compose up -d
 ```
 
 ### 访问入口
@@ -183,8 +209,6 @@ sudo chown -R 1000:1000 data
 3. 把上面那串密钥粘贴进「管理密钥」输入框 → 保存
    （只存在你本机浏览器 localStorage，不会外传）
 
-> 设置了密钥即**自动启用管理 API**，不需要额外开关。
-
 ### 能做什么
 
 | 面板 | 作用 |
@@ -222,8 +246,10 @@ Perplexity / Mimo）直接填 token/cookie，不受影响。
 ## 五、日常运维
 
 ```bash
-./manage.sh up             # 启动（有镜像就直接起）
-./manage.sh status         # 容器状态 + /health + 资源占用
+./manage.sh up             # 启动（缺失时自动拉取镜像）
+./manage.sh pull           # 拉取最新镜像
+./manage.sh update         # 拉取最新镜像并重启
+./manage.sh status         # 容器状态 + 镜像 + /health + 资源占用
 ./manage.sh logs           # 实时日志
 ./manage.sh test           # 冒烟测试 API 与管理台
 ./manage.sh version        # 当前运行的上游版本
@@ -232,12 +258,10 @@ Perplexity / Mimo）直接填 token/cookie，不受影响。
 ./manage.sh keygen         # 生成管理密钥
 ./manage.sh fixdata        # 修复数据卷属主
 ./manage.sh shell          # 进入容器
-
-# 构建
-./manage.sh build          # 完整构建（可复现）
-./manage.sh build-offline  # 离线组装（快，需自备 .build/app-runtime.tgz）
-./manage.sh update         # 拉取上游最新代码并完整重建
+./manage.sh down           # 停止
 ```
+
+升级就是 `./manage.sh update`：拉新镜像 + 重启。数据卷与镜像无关，不会丢配置和账号。
 
 ## 六、容器测试与 CI
 
@@ -250,10 +274,10 @@ Perplexity / Mimo）直接填 token/cookie，不受影响。
 | 阶段 | 内容 |
 |---|---|
 | `lint` | `sh -n` 语法检查 + ShellCheck（只看 error 级） |
-| 构建 | buildx 构建镜像，启用 GHA 层缓存 |
+| 构建 | buildx 构建镜像，启用 GHA 层缓存（约 1 分钟） |
 | 部署验证 | `docker compose config` + **真的用 compose 起一遍**，验证文档里的部署路径 |
 | 冒烟测试 | `tests/smoke.sh` 全套功能测试 |
-| 发布 | 仅 main 与版本 tag，推送到 GHCR |
+| 发布 | 推送 `ghcr.io/liangnianzhi/chat2api:latest` |
 
 触发条件：push 到 main、PR、打 tag、手动触发，以及**每周一次定时构建**。
 
@@ -266,13 +290,16 @@ Perplexity / Mimo）直接填 token/cookie，不受影响。
 
 `tests/smoke.sh` 对运行中的容器做端到端验证：
 
+- 无头运行（日志确认 shim 生效）、无 Chromium/Xvfb 可执行文件
+- **上游 wasm 路径可解析**（否则首个 DeepSeek/GLM 请求会失败）
 - 网关 `/health` 与 OpenAI 兼容路由
-- Web 管理台页面可访问，且代理**拒绝白名单外的路径**
 - 管理 API：无密钥 / 错密钥 → 401，正确密钥 → 200
+- **仅凭密钥自动启用管理 API**（未鉴权 401 而非 404）
+- Web 管理台页面可访问，且代理**拒绝白名单外的路径**
 - 添加账号 → 列表可见，且凭证在读取时**已掩码**
 - 生成客户端 API 密钥
 - AES-256-GCM 加解密往返、密文不含明文、**篡改可检测**
-- 加密密钥落在数据卷（这是上游警告过会导致“静默清空所有账号”的失败模式）
+- 加密密钥落在数据卷（上游警告过：密钥变化会“静默清空所有账号”）
 - `data.json` 确为密文
 - **重启后账号仍在**
 - 改环境变量里的密钥后重启，新密钥生效、旧密钥失效
@@ -281,23 +308,17 @@ Perplexity / Mimo）直接填 token/cookie，不受影响。
 本地也能跑：
 
 ```bash
-IMAGE=chat2api-gateway:latest bash tests/smoke.sh
-```
-
-### 拉取已发布镜像
-
-```bash
-docker pull ghcr.io/liangnianzhi/chat2api:latest
+IMAGE=ghcr.io/liangnianzhi/chat2api:latest bash tests/smoke.sh
 ```
 
 ## 七、关于上游更新
 
-`.env` 的 `CHAT2API_REF` 控制构建版本：
+`.env` 的 `CHAT2API_REF` 控制 CI 构建的上游版本：
 
 - `main`（默认）—— 跟随上游最新提交
 - `v1.7.16` —— 锁定 release，生产环境更稳
 
-`./manage.sh update` 会重新拉源码、编译、平滑替换容器。
+改完后重新触发 CI（push 或手动 workflow_dispatch），然后 `./manage.sh update`。
 
 **升级注意**：本方案依赖三个“接缝”，上游大改时可能需要微调：
 
@@ -308,8 +329,6 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 构建时若 `out/main/headless.js` 未产出，Dockerfile 会**直接失败报警**，
 不会静默产出坏镜像。第六节的每周定时构建就是为了尽早发现这类变化。
 
-数据卷 `./data` 与镜像无关，升级不会丢配置和账号。
-
 ## 八、数据与安全
 
 - **凭证加密**：AES-256-GCM，密钥在 `./data/.chat2api/.safe-storage-key`。
@@ -319,14 +338,15 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 - **管理 API**：可直接读写账号，不要暴露到公网。管理台只监听同源的
   `/v0/management/*` 与 `/health`，其它路径一律 404。
 - 容器以非 root 用户（`node`，uid 1000）运行。
+- 仓库里不含任何密钥：`.env`、`data/` 均已 gitignore。
 
 ## 九、目录结构
 
 ```
 .
-├── Dockerfile                      # 主构建路径：多阶段，从源码编译（可复现）
-├── .offline.Dockerfile             # 备选：从预编译运行目录组装（快）
-├── docker-compose.yml              # 最小化：只管启动参数
+├── Dockerfile                      # CI 用的多阶段构建（从源码编译）
+├── .offline.Dockerfile             # 备选：从预编译运行目录组装（低算力宿主）
+├── docker-compose.yml              # 只用 GHCR 镜像，不在本地构建
 ├── .env.example                    # 配置模板
 ├── .dockerignore / .gitignore
 ├── manage.sh                       # 运维脚本
@@ -365,35 +385,31 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 
 | 项目 | 之前 | 现在 |
 |---|---|---|
-| 镜像体积 | 1.01 GB | **157 MB** |
+| 镜像体积 | 1.01 GB | **~157 MB** |
 | `node_modules` | 302 MB / 245 包 | **3.8 MB / 11 包** |
 | 运行内容（/app） | — | 13.8 MB |
-| 常驻内存 | — | 约 55 MB（网关 + 管理台） |
+| 常驻内存 | — | ~55 MB（网关 + 管理台） |
 
 裁剪依据是上游 `electron.vite.config.ts` 里 `externalizeDepsPlugin` 的
 `exclude` 列表 —— 只有这些包需要留在磁盘上。`shim/prune-deps.js` 会按该列表
 递归保留依赖闭包，并在**缺少必需包时直接让构建失败**，避免产出一个启动即崩的镜像。
 
-### 两条构建路径
+### 构建方式
 
-| 命令 | 说明 | GitHub runner | 群晖 NAS |
-|---|---|---|---|
-| `./manage.sh build` | **推荐**。多阶段，从上游源码编译，完全可复现 | 3–5 分钟 | 40–60 分钟 |
-| `./manage.sh build-offline` | 复用 `.build/app-runtime.tgz`，跳过依赖安装与前端构建 | — | 5–15 分钟 |
+| 方式 | 说明 |
+|---|---|
+| **GitHub Actions（推荐）** | 每次 push 自动构建并推送 GHCR，约 1 分钟；使用方 `./manage.sh pull` 即可 |
+| `./manage.sh build` | 本地从上游源码构建，产物标记为同一个镜像名，compose 会直接使用 |
+| `./manage.sh build-offline` | 低算力宿主的备选：复用预编译目录，跳过依赖安装 |
 
-`build-offline` 是为低算力宿主准备的。群晖 SA6400（DSM 7.4.1，Docker 24.0.2）
-有两个环境限制：
+本地构建并非必需。群晖 SA6400（DSM 7.4.1，Docker 24.0.2）这类机器有两个限制，
+所以推荐直接用 CI 构建好的镜像：
 
 1. **没有 buildx**，只能走 legacy builder，因此 Dockerfile 刻意不使用
    `RUN --mount=type=cache`、`# syntax=` 这类 BuildKit 专有语法。
 2. **磁盘 I/O 是瓶颈**。`vmstat` 显示 iowait 常年 13+，另有 24 个容器同时在跑。
    这种负载下 legacy builder 提交较大的层（如 500MB 的 `node_modules`）
    可能耗时数十分钟；跨阶段复制 300MB 目录甚至会长时间无进展。
-
-两条路径产出的运行内容完全一致。要重新生成 `app-runtime.tgz`：
-先跑一次 `./manage.sh build`，再按 `.offline.Dockerfile` 头部注释导出。
-
-> 注意：更推荐直接在 GitHub Actions 上构建（第六节），然后 `docker pull` 下来。
 
 ## 十一、常见问题
 
@@ -403,15 +419,16 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 **容器起来就退出，日志报 `EACCES: mkdir '/data/.chat2api'`**
 数据卷属主不对：`./manage.sh fixdata && ./manage.sh restart`。
 
+**拉取镜像报 403 / denied**
+GHCR 包默认是**私有**的。要么在 Packages → chat2api → Package settings 里把可见性
+改为 Public，要么先 `docker login ghcr.io`。
+
 **管理台提示「管理 API 未启用」**
 `.env` 里的 `CHAT2API_MANAGEMENT_SECRET` 为空。填上后重启即可。
 
 **账号加了但调用报 “no available account”**
 确认 `credentials` 字段名与当前上游版本一致（用 `/v0/management/providers` 查），
 以及账号 `status` 是 `active`。
-
-**构建很慢**
-见第十节。优先用 GitHub Actions 构建后 `docker pull`。
 
 ## 十二、许可
 
@@ -427,7 +444,7 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 
 | 验证项 | 结果 |
 |---|---|
-| **镜像体积** | ✅ **157 MB**（原 1.01 GB） |
+| **镜像体积** | ✅ ~157 MB（原 1.01 GB） |
 | **node_modules** | ✅ **3.8 MB / 11 包**（原 302 MB / 245 包） |
 | **常驻内存** | ✅ 约 **55 MB**（网关 + 管理台） |
 | 容器启动（无 Electron / Chromium / Xvfb） | ✅ `[gateway] electron shim active` |
@@ -438,10 +455,11 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 | `GET /v1/models` | ✅ `{"object":"list","data":[]}` |
 | **Web 管理台页面** | ✅ HTTP 200，标题 `Chat2API 管理台` |
 | **管理台同源反代管理 API** | ✅ `/v0/management/*` 正常转发 |
-| **仅凭密钥自动启用管理 API** | ✅ 日志 `management API is enabled at /v0/management` |
+| **仅凭密钥自动启用管理 API** | ✅ 未鉴权 -> 401（而非 404） |
 | **经管理台添加账号** | ✅ 返回 `success:true` |
 | **管理台改密钥后重启生效** | ✅ 新密钥可用、旧密钥返回 `invalid_secret` |
 | **账号跨容器重启持久化** | ✅ 重启后账号仍在 |
+| **wasm 路径可解析** | ✅ `process.resourcesPath` 已定义且指向 wasm |
 | 数据目录 | ✅ `/data/.chat2api`（挂载卷，非容器内临时路径） |
 | 配置落盘加密 | ✅ `data.json` 为密文（上游 electron-store 加密） |
 | 凭证加解密往返 | ✅ 加密→解密还原一致 |
@@ -449,6 +467,7 @@ docker pull ghcr.io/liangnianzhi/chat2api:latest
 | 篡改检测（AES-GCM auth tag） | ✅ 能识别被改动的密文 |
 | **加密密钥跨重启持久化** | ✅ 重启后仍能解密旧数据 |
 | 优雅退出（SIGTERM 落盘） | ✅ `received SIGTERM, shutting down` |
+| CI 端到端（lint → 构建 → compose 部署 → 冒烟 → 推送 GHCR） | ✅ 全部通过 |
 
 > **「加密密钥跨重启持久化」最要紧**：上游 `store.ts` 的注释专门警告过，
 > 如果加密密钥在两次启动之间发生变化，加密的 `data.json` 会被当成损坏数据，

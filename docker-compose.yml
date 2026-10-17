@@ -11,9 +11,9 @@
 #
 # 界面和 OpenAI 接口在同一个端口（和原桌面版一致），没有第二个端口。
 #
-# 可调项（一般不用改，按需加 environment:）：
+# 可调项（一般不用改）：
+#   TZ                        容器时区，镜像默认 Asia/Shanghai
 #   CHAT2API_API_KEY          给 /v1 客户端访问加密钥（默认不启用）
-#   TZ=Asia/Shanghai          日志时区，默认 UTC
 services:
   chat2api:
     image: ghcr.io/liangnianzhi/chat2api:latest

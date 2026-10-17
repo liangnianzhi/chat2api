@@ -3,30 +3,26 @@
  *
  * WHAT IT SERVES
  * --------------
- * One address, one HTTP server, the way the desktop app worked:
+ * One address, one HTTP server:
  *
  *   GET /                -> the upstream renderer (the real Chat2API UI)
  *   /assets/*, static    -> files from out/renderer
  *   POST /__ipc          -> dispatch into upstream's ipcMain.handle registry
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
  *   GET  /__preload.js   -> the browser bridge + upstream's preload bundle
+ *   GET  /__login        -> guided login page (see below)
+ *   POST /__login/finish -> validate + store the credential it collected
  *   /management/*        -> rewritten to /v0/management/*, then to the proxy
- *   everything else      -> upstream's HTTP handler (the OpenAI-compatible API)
+ *   everything else      -> upstream's HTTP handler (the API)
  *
- * NO SECOND PORT
+ * THE LOGIN PAGE
  * --------------
- * Upstream's ProxyServer expects to bind a port. The shim intercepts that bind
- * and publishes the replayed request handler as __httpHandler; this module feeds
- * requests straight into it. The proxy is configured for this same public port,
- * so one number appears everywhere - config, the header badge, the management
- * base URL and this server all agree on it.
- *
- * MANAGEMENT AUTH
- * ---------------
- * Upstream's management middleware expects a secret. Requests are handed to the
- * proxy directly here, so this server sets the Authorization header for
- * management paths before the hand-off. Direct API clients are unaffected:
- * /v1 passes through untouched.
+ * Upstream's web login opens an Electron window and reads the provider's tokens
+ * out of it. A container cannot do that, so "web login" would always fail.
+ * Instead the shim answers that request by pointing here: this page opens the
+ * provider site in the user's own browser, says which field to copy, then
+ * validates what they paste before storing it. Honest about the boundary rather
+ * than pretending to automate it.
  */
 
 'use strict'
@@ -40,19 +36,18 @@ const SHIM_PATH = process.env.CHAT2API_SHIM || path.join(APP_DIR, 'shim', 'elect
 const RENDERER_DIR = process.env.CHAT2API_RENDERER_DIR || path.join(APP_DIR, 'upstream', 'renderer')
 const PRELOAD_FILE = process.env.CHAT2API_PRELOAD_FILE || path.join(APP_DIR, 'upstream', 'preload', 'index.js')
 const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'preload-bridge.js')
+const LOGIN_PAGE = process.env.CHAT2API_LOGIN_PAGE || path.join(__dirname, 'login.html')
 
-// The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
 const SECRET_FILE = process.env.CHAT2API_SECRET_FILE
   || path.join(process.env.CHAT2API_HOME || '/data/.chat2api', '.management-secret')
 
-// Upstream's own prefix, and the friendlier alias this server exposes.
 const UPSTREAM_MGMT = '/v0/management'
 const ALIAS_MGMT = '/management'
 
 /* ------------------------------------------------------------------ *
- * Bridge access (same process as the gateway)
+ * Bridge access
  * ------------------------------------------------------------------ */
 let shim = null
 try {
@@ -68,12 +63,6 @@ function bridgeReady() {
   return handlerCount() > 0
 }
 
-/**
- * The captured upstream request handler, or null before the proxy binds.
- *
- * Resolved per request rather than cached: the shim owns the captured handler and
- * may publish it after this server has begun listening.
- */
 function proxyHandler() {
   if (!shim || typeof shim.__httpHandler !== 'function') return null
   try {
@@ -131,12 +120,6 @@ function readSecret() {
   }
 }
 
-/**
- * Inject <base> and the preload script into the renderer's index.html.
- *
- * <base href="/"> matters because vite emits relative asset URLs (./assets/...);
- * on a nested SPA route those would resolve against the route and 404.
- */
 function injectConsoleHtml(html) {
   let out = html
   if (!/<base\s/i.test(out)) {
@@ -148,26 +131,26 @@ function injectConsoleHtml(html) {
   return out
 }
 
-function serveIndex(res) {
-  const upstreamIndex = path.join(RENDERER_DIR, 'index.html')
-  fs.readFile(upstreamIndex, (err, buf) => {
+function sendFile(res, file, type, inject) {
+  fs.readFile(file, (err, buf) => {
     if (err) {
-      console.error('[front] cannot read the upstream UI at', upstreamIndex, '-', err.message)
+      console.error('[front] cannot read', file, '-', err.message)
       res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
-      res.end(
-        'The upstream UI is missing from this image.\n\n'
-        + `Expected: ${upstreamIndex}\n`
-        + 'The API on /v1 is unaffected. Rebuild the image, or report a bug.\n'
-      )
+      res.end('Missing file in this image: ' + file + '\n')
       return
     }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-    res.end(injectConsoleHtml(buf.toString('utf8')))
+    const body = inject ? injectConsoleHtml(buf.toString('utf8')) : buf
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store' })
+    res.end(body)
   })
 }
 
+function serveIndex(res) {
+  sendFile(res, path.join(RENDERER_DIR, 'index.html'), 'text/html; charset=utf-8', true)
+}
+
 /* ------------------------------------------------------------------ *
- * The preload bundle, wrapped for a browser
+ * Preload bundle, wrapped for a browser
  * ------------------------------------------------------------------ */
 function servePreload(res) {
   let bundle
@@ -212,6 +195,13 @@ function readBody(req, limit = 8 * 1024 * 1024) {
   })
 }
 
+async function callIpc(channel, args) {
+  if (!shim || !shim.__ipcHandlers) throw new Error('IPC bridge is not available')
+  const handler = shim.__ipcHandlers.get(channel)
+  if (!handler) throw new Error(`no handler registered for channel: ${channel}`)
+  return await handler({ sender: null, senderFrame: null }, ...(args || []))
+}
+
 async function handleIpc(req, res) {
   const send = (status, payload) => {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -246,6 +236,70 @@ async function handleIpc(req, res) {
     console.error('[front] ipc error on', channel, err && err.message)
     send(200, { ok: false, error: (err && err.message) || String(err) })
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Login page: validation and storage
+ *
+ * Deleting or storing an account is upstream's business, so this endpoint only
+ * forwards to upstream's own OAuth validation and account channels. It does not
+ * write to the store itself - that would duplicate (and could contradict) the
+ * credential encryption and de-duplication upstream already does.
+ * ------------------------------------------------------------------ */
+async function handleLoginFinish(req, res) {
+  const send = (status, payload) => {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(JSON.stringify(payload))
+  }
+
+  let body
+  try {
+    body = JSON.parse(await readBody(req, 256 * 1024))
+  } catch (err) {
+    send(400, { ok: false, error: 'invalid request: ' + err.message })
+    return
+  }
+
+  const providerId = body && body.providerId
+  const providerType = (body && body.providerType) || providerId
+  const credentials = (body && body.credentials) || null
+
+  if (!providerId || !credentials || !Object.keys(credentials).length) {
+    send(400, { ok: false, error: '缺少 providerId 或 credentials' })
+    return
+  }
+
+  // 1) Validate exactly as the UI's own "login with token" path does.
+  let validation
+  try {
+    validation = await callIpc('oauth:validateToken', [{ providerId, providerType, credentials }])
+  } catch (err) {
+    send(200, { ok: false, error: '无法验证凭证：' + err.message })
+    return
+  }
+
+  if (!validation || validation.valid !== true) {
+    send(200, { ok: false, error: (validation && validation.error) || '凭证无效或已过期' })
+    return
+  }
+
+  // 2) Store it through upstream's account channel, so encryption and any
+  //    de-duplication stay upstream's responsibility.
+  const info = validation.accountInfo || {}
+  try {
+    await callIpc('accounts:add', [{
+      providerId,
+      name: info.name || info.email || providerId + '-' + Date.now(),
+      email: info.email || undefined,
+      credentials,
+    }])
+  } catch (err) {
+    send(200, { ok: false, error: '验证通过但保存失败：' + err.message })
+    return
+  }
+
+  console.log(`[front] login page stored an account for ${providerId}`)
+  send(200, { ok: true, account: { name: info.name || null, email: info.email || null } })
 }
 
 function handleEvents(req, res) {
@@ -305,14 +359,13 @@ function serveStatic(res, urlPath) {
 }
 
 /* ------------------------------------------------------------------ *
- * Handing a request to upstream
+ * Request forwarding to upstream
  * ------------------------------------------------------------------ */
 function isManagementPath(urlPath) {
   return urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')
     || urlPath.startsWith(UPSTREAM_MGMT)
 }
 
-/** Attach the management credential and rewrite the alias, in place. */
 function prepareForGateway(req, urlPath) {
   if (!isManagementPath(urlPath)) return
 
@@ -323,20 +376,11 @@ function prepareForGateway(req, urlPath) {
     console.warn('[front] management secret unavailable at', SECRET_FILE)
   }
 
-  // /management/x -> /v0/management/x.
   if (!urlPath.startsWith(UPSTREAM_MGMT)) {
     req.url = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
   }
 }
 
-/**
- * Hand the request to upstream's app in-process.
- *
- * There is deliberately NO loopback fallback any more. The proxy is configured
- * for this same port, so "retry over HTTP" would send the request back to this
- * very server - an infinite loop. When the handler is missing the honest answer
- * is an error.
- */
 function dispatch(req, res, urlPath) {
   prepareForGateway(req, urlPath)
 
@@ -376,6 +420,16 @@ function createServer() {
     if (urlPath === '/__ipc' && req.method === 'POST') { void handleIpc(req, res); return }
     if (urlPath === '/__ipc/events') { handleEvents(req, res); return }
     if (urlPath === '/__preload.js') { servePreload(res); return }
+
+    // The guided login page and the endpoint it posts to.
+    if (urlPath === '/__login') {
+      sendFile(res, LOGIN_PAGE, 'text/html; charset=utf-8', false)
+      return
+    }
+    if (urlPath === '/__login/finish' && req.method === 'POST') {
+      void handleLoginFinish(req, res)
+      return
+    }
 
     if (urlPath === '/health' || urlPath === '/stats'
         || API_PREFIXES.some((p) => urlPath.startsWith(p))) {

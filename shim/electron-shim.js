@@ -11,7 +11,7 @@
  * This module provides those APIs for a plain Node process, plus the plumbing
  * that lets the real renderer drive the real main-process logic from a browser.
  *
- * It also captures upstream's Koa request handler so the front server can serve
+ * It also captures upstream's HTTP request handler so the front server can serve
  * the API without a second listening port. See "single port capture" below.
  */
 
@@ -20,6 +20,7 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const http = require('http')
 const { EventEmitter } = require('events')
 
 const DATA_DIR = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
@@ -113,77 +114,90 @@ const safeStorage = {
 /* ------------------------------------------------------------------ *
  * Single port capture
  *
- * Upstream's ProxyServer owns a Koa app and calls
- * `app.listen(port, host, callback)` to serve it. That would give the container
- * a second listening port.
+ * Upstream's ProxyServer owns a Koa app and calls app.listen(port, host, cb),
+ * which ends at http.Server.prototype.listen. Left alone that opens a second
+ * port for the container.
  *
- * Instead the first listen() on a Koa app is intercepted: the app's request
- * handler is published via __koaHandler, and a stand-in server is returned that
- * is already "listening" without binding a socket. The front server then feeds
- * requests straight into that handler.
+ * CAPTURE POINT: http.Server.prototype.listen
  *
- * The stand-in must call the caller's callback, because upstream does its
- * bookkeeping there (proxyStatusManager.start(), setPort(), a log entry). Skip
- * it and the UI would report the proxy as stopped while it is in fact serving.
+ * Patching Koa's prototype does not work here. electron-vite inlines the app's
+ * dependencies into one bundle, so the Koa class inside upstream's bundle is a
+ * private copy - patching the Koa required from node_modules affects a different
+ * object, and the interception silently never fires. Node's own http module is
+ * shared, so patching its listen() is reliable.
  *
- * This is preferable to reaching into the ProxyServer instance: `proxyServer` is
- * a module-private variable inside upstream's ipc/handlers.ts and is not
- * exported, so there is nothing to import. Intercepting listen() works from the
- * outside and needs no upstream changes.
+ * The first listen() on the default port is intercepted: a handler is built by
+ * replaying the server's own request listeners, __httpHandler is published, and a
+ * stand-in handle is returned that is already "listening". Upstream's callback is
+ * invoked (it does proxyStatusManager bookkeeping there) and its request
+ * listeners are suppressed on the real server so only one path serves requests.
+ *
+ * Returns to normal for any later listen(), so nothing else is affected.
  * ------------------------------------------------------------------ */
-let koaHandler = null
-let koaListening = false
+const INTERCEPT_PORTS = new Set(
+  (process.env.CHAT2API_INTERCEPT_PORTS || '18090,18080,8080')
+    .split(',')
+    .map((p) => parseInt(p.trim(), 10))
+    .filter((p) => Number.isFinite(p))
+)
 
-function installKoaCapture() {
-  let Koa
-  try {
-    Koa = require('koa')
-  } catch (err) {
-    console.warn('[shim] koa not found; falling back to a loopback port:', err.message)
-    return
-  }
+let httpHandler = null
+let httpListening = false
 
-  const proto = Koa.prototype
-  if (proto.__c2aCaptured) return
-  const originalListen = proto.listen
-
-  proto.listen = function capturedListen(...args) {
-    // Only capture the first Koa app to listen: that is upstream's proxy. Any
-    // later listen() falls through to real listening.
-    if (koaHandler) return originalListen.apply(this, args)
-
-    // Node's http.Server.listen accepts the callback last, in any position.
-    const callback = args.find((a) => typeof a === 'function')
-
-    try {
-      koaHandler = this.callback()
-      koaListening = true
-      console.log('[shim] captured the Koa request handler (single port)')
-
-      const stand_in = new EventEmitter()
-      stand_in.listening = true
-      stand_in.close = (cb) => {
-        koaListening = false
-        if (typeof cb === 'function') setTimeout(cb, 0)
-        return stand_in
-      }
-      stand_in.address = () => ({ address: '127.0.0.1', family: 'IPv4', port: 0 })
-      stand_in.ref = () => stand_in
-      stand_in.unref = () => stand_in
-
-      // Upstream's own bookkeeping lives in this callback.
-      if (callback) setTimeout(() => callback(), 0)
-
-      return stand_in
-    } catch (err) {
-      console.warn('[shim] could not capture the Koa handler, listening normally:', err.message)
-      return originalListen.apply(this, args)
-    }
-  }
-  proto.__c2aCaptured = true
+function portFromArgs(args) {
+  const first = args[0]
+  if (first && typeof first === 'object') return first.port
+  return first
 }
 
-installKoaCapture()
+function installHttpCapture() {
+  if (http.Server.prototype.__c2aCaptured) return
+  const originalListen = http.Server.prototype.listen
+
+  http.Server.prototype.listen = function capturedListen(...args) {
+    const port = portFromArgs(args)
+    // Only the first bound port that the app itself asks for is captured.
+    if (httpHandler || !INTERCEPT_PORTS.has(port)) {
+      return originalListen.apply(this, args)
+    }
+
+    const server = this
+    // Node takes the callback last, in any position.
+    const callback = args.find((a) => typeof a === 'function')
+    // Keep the server's request listeners so the handler can replay them; then
+    // detach them so the real server never sees traffic (it never binds anyway).
+    const requestListeners = server.listeners('request').slice()
+    for (const listener of requestListeners) server.removeListener('request', listener)
+
+    httpHandler = function capturedHandler(req, res) {
+      for (const listener of requestListeners) listener.call(server, req, res)
+    }
+    httpListening = true
+    console.log(`[shim] captured the HTTP request handler on :${port} (single port)`)
+
+    const stand_in = new EventEmitter()
+    stand_in.listening = true
+    stand_in.close = (cb) => {
+      httpListening = false
+      if (typeof cb === 'function') setTimeout(cb, 0)
+      return stand_in
+    }
+    stand_in.address = () => ({ address: '127.0.0.1', family: 'IPv4', port })
+    stand_in.ref = () => stand_in
+    stand_in.unref = () => stand_in
+
+    // Upstream's own bookkeeping lives in this callback: proxyStatusManager
+    // .start() / setPort() / setHost() and a log entry. Skip it and the UI would
+    // report the proxy as stopped while it is in fact serving.
+    if (callback) setTimeout(() => callback(), 0)
+
+    return stand_in
+  }
+
+  http.Server.prototype.__c2aCaptured = true
+}
+
+installHttpCapture()
 
 /* ------------------------------------------------------------------ *
  * app
@@ -360,7 +374,6 @@ const session = {
  * net
  * ------------------------------------------------------------------ */
 function buildNetRequest(options, callback) {
-  const http = require('http')
   const https = require('https')
   const { URL } = require('url')
   const url = new URL(options.url)
@@ -523,9 +536,8 @@ module.exports = {
   __eventBus: eventBus,
   __windowStub: windowStub,
   __replayPendingOpens: replayPendingOpens,
-  // The captured upstream Koa handler, or null until the proxy app calls
-  // listen(). The front server polls this; when null it falls back to a
-  // loopback port.
-  __koaHandler: () => koaHandler,
-  __koaListening: () => koaListening,
+  // The captured upstream HTTP handler, or null until the proxy binds. The front
+  // server polls this; when null it falls back to a loopback port.
+  __httpHandler: () => httpHandler,
+  __httpListening: () => httpListening,
 }

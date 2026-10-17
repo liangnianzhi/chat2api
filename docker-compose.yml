@@ -1,0 +1,44 @@
+# Chat2API 网关 —— 最小化 compose
+#
+# 设计原则：compose 只管"把容器跑起来"必须的参数，其余所有可配置项
+# （账号、提供商、API 密钥、负载均衡、日志级别、超时……）全部在 Web 管理台里改。
+#
+# 打开 http://<主机IP>:8081 即可配置。首次需要填写管理密钥
+# （即下面 CHAT2API_MANAGEMENT_SECRET 的值）。
+services:
+  chat2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 跟随上游最新提交；锁定版本可改为具体 tag，如 v1.7.16
+        CHAT2API_REF: ${CHAT2API_REF:-main}
+    image: chat2api-gateway:latest
+    container_name: chat2api
+    restart: unless-stopped
+    ports:
+      - "${CHAT2API_BIND:-0.0.0.0}:${CHAT2API_PORT:-8080}:8080"   # OpenAI 兼容 API
+      - "${CHAT2API_BIND:-0.0.0.0}:${CHAT2API_UI_PORT:-8081}:8081" # Web 管理台
+    volumes:
+      # 账号、配置、日志与凭证加密密钥都在这里。务必单独备份。
+      # 需属主为 1000:1000（./manage.sh up 会自动修正）。
+      - ./data:/data
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 管理台登录用的密钥。留空则管理台无法登录。
+      CHAT2API_MANAGEMENT_SECRET: ${CHAT2API_MANAGEMENT_SECRET:-}
+
+# ---------------------------------------------------------------------------
+# 以下参数已从 compose 中移除，改为在 Web 管理台配置（写入 data/）：
+#   * 客户端 API 密钥        -> 管理台「客户端 API 密钥」页
+#   * 负载均衡策略           -> 管理台「代理设置」
+#   * 日志级别 / 超时 / 重试 -> 管理台「代理设置」
+#   * 账号与提供商           -> 管理台「添加账号」
+#
+# 若确实想用环境变量覆盖（例如做声明式部署），以下变量仍被识别：
+#   CHAT2API_API_KEY / CHAT2API_ENABLE_API_KEY
+#   CHAT2API_LOG_LEVEL / CHAT2API_LB_STRATEGY
+#   CHAT2API_REQUEST_TIMEOUT / CHAT2API_RETRY_COUNT
+#   CHAT2API_ENABLE_CORS / CHAT2API_CORS_ORIGIN
+#   CHAT2API_ENABLE_WEBUI=false    关闭管理台
+# ---------------------------------------------------------------------------

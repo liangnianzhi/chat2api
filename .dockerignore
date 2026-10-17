@@ -1,0 +1,14 @@
+# 保持构建上下文小而确定。
+#
+# 数据卷含凭证与加密密钥，绝不能打进镜像。
+data/
+.freshdata/
+
+# 说明：.build/ 里的 app-runtime.tgz 是 build-offline 路径需要的，
+# 因此**不能**排除 —— 主 Dockerfile 不读它，但同在上下文里无妨。
+
+*.log
+.env
+.git/
+.github/
+tests/

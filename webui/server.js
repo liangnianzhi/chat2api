@@ -9,9 +9,18 @@
  *   /assets/*, static    -> files from out/renderer
  *   POST /__ipc          -> dispatch into upstream's ipcMain.handle registry
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
- *   GET  /__preload.js   -> upstream's preload bundle, wrapped for the browser
+ *   GET  /__preload.js   -> the browser bridge + upstream's preload bundle
  *   /management/*        -> rewritten to /v0/management/* and proxied
- *   /v1/*, /v0/*, /health, /stats -> proxied to the gateway on loopback
+ *   /v1/*, /v0/*, /health, /stats -> proxied to the gateway
+ *
+ * THE SINGLE PORT
+ * ---------------
+ * 8082 is the only port that exists as far as the host is concerned. Inside the
+ * container the gateway listens on loopback at CHAT2API_INTERNAL_PORT, because
+ * upstream's ProxyServer takes an explicit listen port and cannot serve from a
+ * request handler. That address is an implementation detail: it is never
+ * published, and everything the operator uses - UI, API, management - arrives on
+ * 8082.
  *
  * WHY THE REAL RENDERER
  * ---------------------
@@ -32,13 +41,6 @@
  * The handler registry lives in this process (the shim records handlers as
  * upstream registers them). A separate process could not reach it, so
  * gateway.js requires this module instead of spawning it.
- *
- * THE BRIDGE IS NOT AUTHENTICATION
- * ---------------------------------
- * The management API requires a secret. This server attaches it server-side for
- * management requests, so the browser needs no credential and direct callers
- * still do - but, since the UI and the API share a port, anyone who can reach
- * the port can administer. That is the accepted tradeoff of a single address.
  */
 
 'use strict'
@@ -51,11 +53,14 @@ const APP_DIR = process.env.CHAT2API_APP_DIR || path.join(__dirname, '..')
 const SHIM_PATH = process.env.CHAT2API_SHIM || path.join(APP_DIR, 'shim', 'electron-shim.js')
 const RENDERER_DIR = process.env.CHAT2API_RENDERER_DIR || path.join(APP_DIR, 'upstream', 'renderer')
 const PRELOAD_FILE = process.env.CHAT2API_PRELOAD_FILE || path.join(APP_DIR, 'upstream', 'preload', 'index.js')
+const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'preload-bridge.js')
 
+// The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
+// The gateway's own listen address, inside the container, never published.
 const GATEWAY = {
-  host: process.env.CHAT2API_UI_UPSTREAM_HOST || '127.0.0.1',
+  host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
 }
 const SECRET_FILE = process.env.CHAT2API_SECRET_FILE
@@ -82,7 +87,6 @@ function bridgeReady() {
   return handlerCount() > 0
 }
 
-// The shim emits one array argument per event, e.g. emit(channel, [a, b]).
 const streamClients = new Set()
 if (shim && shim.__eventBus) {
   const bus = shim.__eventBus
@@ -170,95 +174,14 @@ function serveIndex(res) {
 /* ------------------------------------------------------------------ *
  * The preload bundle, wrapped for a browser
  * ------------------------------------------------------------------ */
-const STUB = `(function () {
-  var listeners = Object.create(null);
-  var stream = null;
-  function rpc(channel, args) {
-    return fetch('/__ipc', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: channel, args: args || [] })
-    }).then(function (r) { return r.json(); }).then(function (r) {
-      if (r && r.ok) return r.result;
-      throw new Error((r && r.error) || ('ipc failed: ' + channel));
-    });
-  }
-  function connect() {
-    if (stream || typeof EventSource === 'undefined') return;
-    stream = new EventSource('/__ipc/events');
-    stream.onmessage = function (e) {
-      var msg;
-      try { msg = JSON.parse(e.data); } catch (_) { return; }
-      if (msg.channel === '__c2a:openExternal') {
-        try { window.open(msg.args[0], '_blank', 'noopener'); } catch (_) {}
-        return;
-      }
-      var set = listeners[msg.channel];
-      if (!set) return;
-      set.forEach(function (fn) {
-        try { fn.apply(null, [{}].concat(msg.args || [])); }
-        catch (err) { console.error('[ipc]', msg.channel, err); }
-      });
-    };
-  }
-  var ipcRenderer = {
-    invoke: function (channel) {
-      return rpc(channel, Array.prototype.slice.call(arguments, 1));
-    },
-    send: function (channel) {
-      rpc(channel, Array.prototype.slice.call(arguments, 1)).catch(function () {});
-    },
-    sendSync: function () { throw new Error('sendSync is not available over the HTTP bridge'); },
-    on: function (channel, fn) {
-      connect();
-      (listeners[channel] = listeners[channel] || new Set()).add(fn);
-      return ipcRenderer;
-    },
-    once: function (channel, fn) {
-      var self = this;
-      function wrapped() { self.removeListener(channel, wrapped); fn.apply(null, arguments); }
-      return self.on(channel, wrapped);
-    },
-    removeListener: function (channel, fn) {
-      if (listeners[channel]) listeners[channel].delete(fn);
-      return ipcRenderer;
-    },
-    removeAllListeners: function (channel) {
-      if (channel === undefined) listeners = Object.create(null);
-      else delete listeners[channel];
-      return ipcRenderer;
-    },
-    listenerCount: function (channel) {
-      return listeners[channel] ? listeners[channel].size : 0;
-    }
-  };
-  var electronStub = {
-    ipcRenderer: ipcRenderer,
-    contextBridge: { exposeInMainWorld: function (key, value) { window[key] = value; } },
-    webFrame: { setZoomFactor: function () {}, getZoomFactor: function () { return 1; } },
-    shell: { openExternal: function (u) { try { window.open(u, '_blank', 'noopener'); } catch (_) {} } }
-  };
-  window.__c2a_electron = electronStub;
-  window.__c2a_require = function (name) {
-    if (name === 'electron') return electronStub;
-    throw new Error('unexpected require in preload bundle: ' + name);
-  };
-  window.__c2a_module = { exports: {} };
-  window.__c2a_process = {
-    env: { NODE_ENV: 'production' },
-    platform: 'linux',
-    versions: {},
-    type: 'renderer',
-    nextTick: function (f) { setTimeout(f, 0); }
-  };
-}());`
-
 function servePreload(res) {
   let bundle
+  let bridge
   try {
     bundle = fs.readFileSync(PRELOAD_FILE, 'utf8')
+    bridge = fs.readFileSync(BRIDGE_FILE, 'utf8')
   } catch (err) {
-    console.error('[front] cannot read preload bundle:', PRELOAD_FILE, err.message)
+    console.error('[front] cannot read preload files:', err.message)
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
     res.end('preload bundle not found')
     return
@@ -270,7 +193,7 @@ function servePreload(res) {
     console.error('[front] preload bundle looks like ESM; the CJS wrapper will not work')
   }
 
-  const js = STUB
+  const js = bridge
     + '\n;(function (require, module, exports, process) {\n'
     + bundle
     + '\n}).call(window, window.__c2a_require, window.__c2a_module, window.__c2a_module.exports, window.__c2a_process);\n'
@@ -392,8 +315,6 @@ function serveStatic(res, urlPath) {
 function proxy(req, res, urlPath) {
   const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
 
-  // Only the management API needs the injected credential; /v1 passes through
-  // untouched so client API keys keep working as usual.
   if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')
       || urlPath.startsWith(UPSTREAM_MGMT)) {
     const secret = readSecret()
@@ -451,7 +372,6 @@ function createServer() {
     if (urlPath === '/__ipc/events') { handleEvents(req, res); return }
     if (urlPath === '/__preload.js') { servePreload(res); return }
 
-    // API surface always proxies, so it never falls through to the SPA fallback.
     if (urlPath === '/health' || urlPath === '/stats'
         || API_PREFIXES.some((p) => urlPath.startsWith(p))) {
       proxy(req, res, urlPath)
@@ -461,7 +381,6 @@ function createServer() {
     if (req.method === 'GET' || req.method === 'HEAD') {
       if (urlPath === '/' || urlPath === '/index.html') { serveIndex(res); return }
       if (serveStatic(res, urlPath)) return
-      // A path without a file extension is a client-side route.
       if (!path.extname(urlPath)) { serveIndex(res); return }
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
       res.end('Not found: ' + urlPath)
@@ -475,14 +394,13 @@ function createServer() {
 function start() {
   const server = createServer()
   server.listen(PUBLIC_PORT, PUBLIC_HOST, () => {
-    console.log(`[front] listening on http://${PUBLIC_HOST}:${PUBLIC_PORT}`)
+    console.log(`[front] Chat2API ready on http://${PUBLIC_HOST}:${PUBLIC_PORT} (the only published port)`)
     if (bridgeReady()) {
       console.log(`[front] UI: upstream renderer, IPC bridge active (${handlerCount()} channels)`)
     } else {
       console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
       console.warn('[front] The API on /v1 is unaffected. See the log above for the cause.')
     }
-    console.log(`[front] proxying /v1, /v0, /health and ${ALIAS_MGMT} -> http://${GATEWAY.host}:${GATEWAY.port}`)
   })
 
   const shutdown = (sig) => {

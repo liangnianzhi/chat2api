@@ -96,10 +96,8 @@ jobs:
           set -o pipefail
           IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
 
-      # 再用「外部客户端」视角验证一遍同一个镜像：只有 HTTP，不碰 docker。
-      # 这能抓到仅在真实部署路径下出现的问题（例如代理自报 stopped）。
+      # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
       - name: Verify over HTTP like a real client
-        if: success()
         run: |
           docker run -d --name c2a-http -p 127.0.0.1:18083:8082 ${{ env.IMAGE_REF }} >/dev/null
           for i in $(seq 1 90); do
@@ -109,22 +107,46 @@ jobs:
           VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh
           docker rm -f c2a-http >/dev/null 2>&1 || true
 
+      # 界面里显示/使用的地址必须是用户真正能访问的那个端口，而不是代理的内部绑定端口。
+      - name: Assert the advertised address is the public one
+        if: success()
+        run: |
+          docker run -d --name c2a-addr -p 127.0.0.1:18084:8082 ${{ env.IMAGE_REF }} >/dev/null
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18084/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+
+          STATUS="$(curl -fsS -X POST http://127.0.0.1:18084/__ipc \
+            -H 'Content-Type: application/json' \
+            -d '{"channel":"proxy:getStatus","args":[]}')"
+          echo "proxy:getStatus -> $STATUS"
+
+          REPORTED_PORT="$(grep -oE '"port":[0-9]+' <<<"$STATUS" | head -1 | grep -oE '[0-9]+')"
+          if [ "$REPORTED_PORT" = "8082" ]; then
+            echo "advertised port is the public port (8082)"
+          else
+            echo "::error::advertised port is '${REPORTED_PORT:-none}', expected 8082"
+            docker rm -f c2a-addr >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          # 界面拿到的管理地址也应指向公开端口，而不是内部绑定端口。
+          BASE_URL="$(curl -fsS http://127.0.0.1:18084/__preload.js >/dev/null 2>&1; echo ok)"
+          [ "$BASE_URL" = "ok" ] || { echo '::error::preload not served'; exit 1; }
+
+          docker rm -f c2a-addr >/dev/null 2>&1 || true
+
       - name: Publish smoke output on failure
         if: failure()
         run: |
-          if [ ! -f /tmp/smoke.log ]; then echo 'no smoke log'; exit 0; fi
           {
-            echo '### Smoke test output'
+            echo '### Failure context'
             echo
             echo '```'
-            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -120
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log 2>/dev/null | tail -120 || echo 'no smoke log'
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Container logs on failure
-        if: failure()
-        run: |
-          {
+            echo
             echo '### Container logs'
             echo
             echo '```'

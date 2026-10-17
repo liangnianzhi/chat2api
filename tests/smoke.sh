@@ -87,28 +87,30 @@ grep -q 'electron shim active' <<<"$LOGS" \
 grep -q '\[front\] Chat2API ready on http://0.0.0.0:8082' <<<"$LOGS" \
   && pass "对外只监听 8082" || fail "未在 8082 就绪"
 
-PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sort -u | tr '\n' ' ')"
-if [ "$(echo "$PORTS" | wc -w)" = "1" ] && [[ "$PORTS" == *":${PORT}"* ]]; then
+# docker port 每个绑定的 socket 输出一行，双栈主机会把同一宿主端口报两次。
+# 因此按宿主端口去重后计数，才是「发布端口个数」。
+PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sed 's/.*://' | sort -u | tr '\n' ' ')"
+PORT_COUNT="$(echo "$PORTS" | wc -w | tr -d ' ')"
+if [ "$PORT_COUNT" = "1" ] && [ "$(echo "$PORTS" | tr -d ' ')" = "${PORT}" ]; then
   pass "宿主机只有 1 个发布端口（$PORTS）"
 else
   fail "发布端口异常: $PORTS"
 fi
 
-# 合并的核心断言：Koa handler 被截获，且没有回退到回环端口。
-grep -q 'captured the Koa request handler' <<<"$LOGS" \
-  && pass "已截获上游 Koa 请求处理器" || fail "未截获 Koa 处理器（说明回退到了回环端口）"
+# 合并的核心断言：捕获生效，且没有回退到回环端口。
+grep -q 'captured the HTTP request handler' <<<"$LOGS" \
+  && pass "已捕获上游 HTTP 请求处理器" || fail "未捕获处理器（说明回退到了回环端口）"
 grep -q 'API: served in-process, no second port' <<<"$LOGS" \
   && pass "API 由同一端口进程内处理" || fail "API 未走进程内处理"
 
-# 容器内不应有第二个监听端口（除 8082 外）。
-LISTENERS="$(in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -cE ':(8082|18090) ' || true)"
-if ! in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -q ':18090 '; then
-  pass "容器内没有 18090 监听（回环端口已消除）"
+# 容器内不应再有回环监听端口：唯一监听应是 8082。
+if in_container 'netstat -tln 2>/dev/null || ss -tln 2>/dev/null' | grep -q ':18090 '; then
+  fail "容器内仍有 18090 在监听（合并未生效）"
 else
-  fail "容器内仍有 18090 在监听"
+  pass "容器内没有 18090 监听（回环端口已消除）"
 fi
 
-# 上游必须仍然认为自己「在运行」——否则界面会显示已停止。
+# 上游必须仍自报 running：这只在 listen 回调被调用时才会发生。
 PROXY_STATE="$(curl -fsS "http://127.0.0.1:${PORT}/health" 2>/dev/null | grep -oE '"status":"[a-z]+"' | head -1)"
 [ "$PROXY_STATE" = '"status":"running"' ] \
   && pass "上游代理自报 running（listen 回调已触发）" \

@@ -145,37 +145,45 @@ fi
 
 info "登录页（网页登录的替代路径）"
 LOGIN_HTML="$(curl -fsS "${BASE}/__login?provider=deepseek&providerId=deepseek" || echo '')"
+# 按英文标识断言，不依赖会被 JSON 转义的中文文案。
 grep -q 'userToken' <<<"$LOGIN_HTML" \
   && pass "/__login 返回带提供商指引的页面" \
-  || fail "/__login 内容异常（缺少该提供商的注取指引）"
+  || fail "/__login 内容异常（缺少该提供商的取值指引）"
+grep -q '/__login/finish' <<<"$LOGIN_HTML" \
+  && pass "登录页会把凭证提交到 /__login/finish" \
+  || fail "登录页缺少提交目标"
 
-# 未授权调用不得直接写入账号：缺参数应拒。
+# 缺参数必须拒。
 BAD_FINISH="$(curl -s -X POST "${BASE}/__login/finish" -H 'Content-Type: application/json' \
   -d '{}' 2>/dev/null || echo '')"
 grep -q '"ok":false' <<<"$BAD_FINISH" \
   && pass "缺参数提交被拒绝" || fail "缺参数提交未被拒绝: $BAD_FINISH"
 
-# 无效凭证必须被上游验证抦下，而不是先存下再说。
+# 无效凭证必须被上游验证拦下，而不是先存下再说。
 INVALID_FINISH="$(curl -s -X POST "${BASE}/__login/finish" -H 'Content-Type: application/json' \
-  -d '{"providerId":"deepseek","providerType":"deepseek","credentials":{"token":"obviously-invalid-token"}}' \
+  -d '{"providerId":"deepseek","providerType":"deepseek","credentials":{"token":"obviously-invalid-token-0001"}}' \
   2>/dev/null || echo '')"
 if grep -q '"ok":false' <<<"$INVALID_FINISH"; then
-  pass "无效凭证被验证拒绝（未写入账号）"
+  pass "无效凭证被拒绝（未写入账号）"
 else
   fail "无效凭证未被拒绝: $INVALID_FINISH"
 fi
 
 if [ -z "$VERIFY_URL" ]; then
   info "网页登录不再报错，而是引导到登录页"
-  # 容器里开不了 Electron 窗口；这条必须给出一条引导，而不是报窗口错误。
+  # 容器里开不了 Electron 窗口；必须给出引导，而不是报窗口错误。
   IAL="$(curl -sS -X POST "${BASE}/__ipc" -H 'Content-Type: application/json' \
     -d '{"channel":"oauth:startInAppLogin","args":[{"providerId":"deepseek","providerType":"deepseek"}]}' \
     2>/dev/null || echo '')"
-  if grep -q '登录页\|\/__login' <<<"$IAL"; then
-    pass "startInAppLogin 返回引导（指向登录页）"
+  # 断言机器可读标记，不匹配中文文案。
+  if grep -q 'login_page_opened' <<<"$IAL"; then
+    pass "startInAppLogin 返回引导（login_page_opened）"
   else
     fail "startInAppLogin 未返回引导: $IAL"
   fi
+  grep -q '/__login' <<<"$IAL" \
+    && pass "引导中包含登录页地址" \
+    || fail "引导中没有登录页地址: $IAL"
   grep -qi 'BrowserWindow\|ENOTSUP' <<<"$IAL" \
     && fail "startInAppLogin 仍在报 GUI 不可用错误" \
     || pass "startInAppLogin 不再报 GUI 错误"

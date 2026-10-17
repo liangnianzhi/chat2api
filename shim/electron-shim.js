@@ -1,15 +1,16 @@
 /**
  * Electron API shim for headless (container) operation.
  *
- * The upstream Chat2API proxy is a plain Koa/Node application whose only
- * Electron touchpoints are:
- *   - store/store.ts               : app, safeStorage, BrowserWindow
- *   - proxy/adapters/perplexity.ts : net
- *   - proxy/captchaWindow.ts       : BrowserWindow, session  (Qwen captcha, unused here)
+ * The upstream Chat2API application is an Electron app whose proxy is plain
+ * Koa/Node. Only three proxy files touch Electron:
  *
- * This module provides just enough of those APIs for the proxy + store to run
- * in a plain Node.js process. Anything genuinely requiring a Chromium window
- * throws a clear, explicit error instead of failing silently.
+ *   store/store.ts            app, safeStorage, BrowserWindow
+ *   proxy/adapters/perplexity net
+ *   proxy/captchaWindow.ts    BrowserWindow, session (Qwen captcha)
+ *
+ * This module provides those APIs for a plain Node process, plus the plumbing
+ * that lets the real renderer drive the real main-process logic from a browser
+ * (see "IPC bridge" below).
  */
 
 'use strict'
@@ -17,6 +18,7 @@
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { EventEmitter } = require('events')
 
 const DATA_DIR = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
 const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
@@ -31,13 +33,11 @@ const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
  *     ? path.join(process.resourcesPath, "sha3_wasm_bg.7b9ca65ddd.wasm")
  *     : path.join(app.getAppPath(), "sha3_wasm_bg.7b9ca65ddd.wasm")
  *
- * With app.isPackaged = true and resourcesPath undefined, that path.join throws
- * a TypeError - so signing would fail on the first real request. Point it at the
- * directory that actually holds the wasm (the image puts it beside the bundle).
+ * With app.isPackaged = true and resourcesPath undefined that path.join throws
+ * a TypeError - so signing would fail on the first real request. Point it at
+ * the directory that actually holds the wasm (beside the bundle).
  * ------------------------------------------------------------------ */
-const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR
-  || path.join(__dirname, '..', 'upstream')
-
+const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR || path.join(__dirname, '..', 'upstream')
 if (typeof process.resourcesPath !== 'string') {
   try {
     Object.defineProperty(process, 'resourcesPath', {
@@ -47,19 +47,19 @@ if (typeof process.resourcesPath !== 'string') {
       enumerable: false,
     })
   } catch {
-    // If the property is locked down, fall back to plain assignment.
     process.resourcesPath = RESOURCES_DIR
   }
 }
 
 /* ------------------------------------------------------------------ *
  * safeStorage
- * Electron's safeStorage encrypts via the OS keyring. In a container there
- * is no keyring, so we persist a random key on the data volume and use
- * AES-256-GCM. Format is versioned so it stays self-describing.
  *
- * The key MUST stay stable across restarts. Upstream's store.ts warns that if
- * it changes, the encrypted data.json is read as corrupt and the recovery path
+ * Electron's safeStorage encrypts via the OS keyring. A container has none, so
+ * a random key is persisted on the data volume and AES-256-GCM is used instead.
+ * The format is versioned so it stays self-describing.
+ *
+ * The key MUST stay stable across restarts: upstream's store.ts warns that if it
+ * changes, the encrypted data.json is read as corrupt and the recovery path
  * silently wipes every account.
  * ------------------------------------------------------------------ */
 function loadOrCreateKey() {
@@ -68,8 +68,9 @@ function loadOrCreateKey() {
       const raw = fs.readFileSync(SECRET_FILE, 'utf8').trim()
       if (raw.length === 64) return Buffer.from(raw, 'hex')
     }
-  } catch { /* fall through and regenerate */ }
-
+  } catch {
+    /* fall through and regenerate */
+  }
   const key = crypto.randomBytes(32)
   try {
     fs.mkdirSync(path.dirname(SECRET_FILE), { recursive: true })
@@ -88,7 +89,6 @@ function getKey() {
 
 const safeStorage = {
   isEncryptionAvailable() {
-    // Always true: we supply our own crypto rather than relying on a keyring.
     return true
   },
   encryptString(plainText) {
@@ -96,7 +96,7 @@ const safeStorage = {
     const cipher = crypto.createCipheriv('aes-256-gcm', getKey(), iv)
     const enc = Buffer.concat([cipher.update(String(plainText), 'utf8'), cipher.final()])
     const tag = cipher.getAuthTag()
-    // v1:<iv>:<tag>:<payload>  (base64 fields)
+    // v1:<iv>:<tag>:<ciphertext>  (all base64)
     const packed = `v1:${iv.toString('base64')}:${tag.toString('base64')}:${enc.toString('base64')}`
     return Buffer.from(packed, 'utf8')
   },
@@ -135,6 +135,7 @@ const app = {
   getName: () => 'Chat2API',
   getPath: (name) => appPaths[name] || DATA_DIR,
   getAppPath: () => RESOURCES_DIR,
+  getLocale: () => 'zh-CN',
   setPath: () => {},
   quit: () => { process.exit(0) },
   exit: (code) => { process.exit(code || 0) },
@@ -149,41 +150,121 @@ const app = {
   emit: () => false,
   commandLine: { appendSwitch: () => {}, appendArgument: () => {} },
   disableHardwareAcceleration: () => {},
+  // Used by lib/autoStart. There is no login session to register into, and the
+  // container's own restart policy is what keeps it running.
+  setLoginItemSettings: () => {},
+  getLoginItemSettings: () => ({ openAtLogin: false }),
+  setAppUserModelId: () => {},
+  setAboutPanelOptions: () => {},
   isPackaged: true,
+  // Upstream sets this before closing to distinguish quit from hide-to-tray.
+  isQuitting: false,
 }
 
 /* ------------------------------------------------------------------ *
+ * IPC bridge
+ *
+ * Upstream registers every renderer-facing capability as
+ * `ipcMain.handle(channel, fn)`. Recording those handlers is what lets the real
+ * renderer run in a browser: the front server dispatches HTTP calls into this
+ * map, so every UI action lands on upstream's own implementation.
+ *
+ * The window stub stands in for the BrowserWindow that would normally exist.
+ * Its webContents.send feeds the event bus (so status/config/OAuth events reach
+ * the page), and it carries the window methods upstream calls on mainWindow.
+ * ------------------------------------------------------------------ */
+const eventBus = new EventEmitter()
+// SSE listeners can be several; the UI may open more than one tab.
+eventBus.setMaxListeners(0)
+
+const ipcHandlers = new Map()
+const ipcListeners = new Map()
+
+const ipcMain = {
+  handle: (channel, fn) => { ipcHandlers.set(channel, fn) },
+  handleOnce: (channel, fn) => { ipcHandlers.set(channel, fn) },
+  removeHandler: (channel) => { ipcHandlers.delete(channel) },
+  on: (channel, fn) => {
+    if (!ipcListeners.has(channel)) ipcListeners.set(channel, [])
+    ipcListeners.get(channel).push(fn)
+    return ipcMain
+  },
+  once: (channel, fn) => {
+    const wrapped = (...args) => { ipcMain.removeListener(channel, wrapped); fn(...args) }
+    return ipcMain.on(channel, wrapped)
+  },
+  removeListener: (channel, fn) => {
+    const list = ipcListeners.get(channel)
+    if (list) ipcListeners.set(channel, list.filter((f) => f !== fn))
+    return ipcMain
+  },
+  removeAllListeners: (channel) => {
+    if (channel === undefined) ipcListeners.clear()
+    else ipcListeners.delete(channel)
+    return ipcMain
+  },
+}
+
+const windowStub = {
+  webContents: {
+    send: (channel, ...args) => { eventBus.emit(channel, args) },
+    on: () => {}, once: () => {}, removeListener: () => {},
+    executeJavaScript: async () => undefined,
+    openDevTools: () => {}, closeDevTools: () => {},
+    setWindowOpenHandler: () => {},
+    session: null,
+  },
+  isDestroyed: () => false,
+  isMinimized: () => false,
+  isMaximized: () => false,
+  isVisible: () => true,
+  isFullScreen: () => false,
+  minimize: () => {},
+  maximize: () => {},
+  unmaximize: () => {},
+  restore: () => {},
+  hide: () => {},
+  show: () => {},
+  focus: () => {},
+  blur: () => {},
+  close: () => {},
+  destroy: () => {},
+  setTitle: () => {},
+  loadURL: async () => {},
+  loadFile: async () => {},
+  setMenu: () => {},
+  on: () => {}, once: () => {}, removeListener: () => {},
+}
+windowStub.webContents.session = null
+
+/* ------------------------------------------------------------------ *
  * BrowserWindow / session
- * Upstream uses these only for optional GUI features (the Qwen
- * auto-registration captcha window). Guard them loudly rather than
- * pretending to work, so failures are diagnosable.
+ *
+ * Only optional GUI features use these (the Qwen captcha window). Constructing
+ * a real window in a browser-hosted UI makes no sense, so it throws a message
+ * that points at the manual path. getAllWindows() still returns the stub so
+ * upstream's broadcast loops reach the event bus.
  * ------------------------------------------------------------------ */
 function unsupported(feature) {
   const err = new Error(
-    `[shim] ${feature} requires an Electron GUI, which is not available in this ` +
-    `headless container build. Add the account by supplying its token/cookie ` +
-    `directly instead of using the in-app browser login.`
+    `[shim] ${feature} requires an Electron GUI, which this headless container `
+    + `does not have. Supply the account's token/cookie directly, or complete `
+    + `the verification in your own browser and paste the resulting cookie.`
   )
   err.code = 'ENOTSUP_HEADLESS'
   return err
 }
 
 class BrowserWindow {
-  constructor() {
-    throw unsupported('BrowserWindow')
-  }
-  static getAllWindows() { return [] }
-  static getFocusedWindow() { return null }
+  constructor() { throw unsupported('BrowserWindow') }
+  static getAllWindows() { return [windowStub] }
+  static getFocusedWindow() { return windowStub }
   static fromWebContents() { return null }
 }
 
 const session = {
   defaultSession: {
-    cookies: {
-      get: async () => [],
-      set: async () => {},
-      remove: async () => {},
-    },
+    cookies: { get: async () => [], set: async () => {}, remove: async () => {} },
     clearStorageData: async () => {},
     setProxy: async () => {},
   },
@@ -193,15 +274,14 @@ const session = {
 
 /* ------------------------------------------------------------------ *
  * net
- * Chromium's net module backs the Perplexity adapter. Node's built-in
- * http/https provides the equivalent; it honours a configured upstream
- * proxy so container deployments can still route outbound traffic.
+ *
+ * Chromium's net module backs the Perplexity adapter. Node's http/https is the
+ * equivalent and honours a configured upstream proxy.
  * ------------------------------------------------------------------ */
 function buildNetRequest(options, callback) {
   const http = require('http')
   const https = require('https')
   const { URL } = require('url')
-
   const url = new URL(options.url)
   const isHttps = url.protocol === 'https:'
   const transport = isHttps ? https : http
@@ -221,14 +301,15 @@ function buildNetRequest(options, callback) {
     }
   }
 
-  // Optional upstream proxy support (HTTP CONNECT tunnelling via agent).
   let agent
   const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy
   if (proxyUrl && isHttps) {
     try {
       const { HttpsProxyAgent } = require('https-proxy-agent')
       agent = new HttpsProxyAgent(proxyUrl)
-    } catch { /* dependency absent - connect directly */ }
+    } catch {
+      /* dependency absent - connect directly */
+    }
   }
 
   const req = transport.request(
@@ -250,11 +331,9 @@ function buildNetRequest(options, callback) {
       })
     }
   )
-
   req.on('error', (err) => {
     if (callback) callback(-1, err.message, {}, Buffer.alloc(0))
   })
-
   if (body) req.write(body)
 
   return {
@@ -278,15 +357,17 @@ const net = {
 }
 
 /* ------------------------------------------------------------------ *
- * Remaining stubs
+ * shell / dialog
  * ------------------------------------------------------------------ */
 const shell = {
-  openExternal: async (url) => { console.log('[shim] shell.openExternal ignored:', url) },
+  openExternal: async (url) => {
+    // No desktop to open onto. Hand it to the UI, which opens a real tab.
+    console.log('[shim] shell.openExternal -> browser tab:', url)
+    eventBus.emit('__c2a:openExternal', [String(url)])
+  },
   showItemInFolder: () => {},
   openPath: async () => '',
 }
-
-const ipcMain = { handle: () => {}, on: () => {}, removeHandler: () => {} }
 
 const dialog = {
   showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
@@ -294,12 +375,39 @@ const dialog = {
   showMessageBox: async () => ({ response: 0 }),
 }
 
-function Tray() { throw unsupported('Tray') }
-function Menu() { throw unsupported('Menu') }
-
+/* ------------------------------------------------------------------ *
+ * Tray / Menu / nativeImage
+ *
+ * Inert rather than throwing: registerIpcHandlers calls
+ * TrayManager.getInstance().updateProxyStatus() from the proxy start/stop
+ * handlers, and a throw there would break the UI's own controls.
+ * ------------------------------------------------------------------ */
 const nativeImage = {
-  createFromPath: () => ({ isEmpty: () => true, resize: () => nativeImage.createEmpty() }),
-  createEmpty: () => ({ isEmpty: () => true }),
+  createFromPath: () => ({
+    isEmpty: () => true,
+    resize: () => nativeImage.createEmpty(),
+    setTemplateImage: () => {},
+  }),
+  createEmpty: () => ({
+    isEmpty: () => true,
+    resize: () => nativeImage.createEmpty(),
+    setTemplateImage: () => {},
+  }),
+}
+
+class Tray {
+  constructor() { console.log('[shim] Tray is inert in the container build') }
+  setToolTip() {} setImage() {} setContextMenu() {} setTitle() {}
+  on() {} once() {} removeAllListeners() {} destroy() {} popUpContextMenu() {}
+}
+
+class Menu {
+  static buildFromTemplate() { return new Menu() }
+  static setApplicationMenu() {}
+  static getApplicationMenu() { return null }
+  popup() {}
+  closePopup() {}
+  append() { return this }
 }
 
 const screen = {
@@ -325,6 +433,12 @@ module.exports = {
   screen,
   clipboard,
   powerMonitor,
-  // Not a real Electron export: lets the entrypoint detect the shim.
+
+  // Not real Electron exports: these are the bridge plumbing, consumed by
+  // shim/gateway.js and webui/server.js, which run in this same process.
   __isShim: true,
+  __ipcHandlers: ipcHandlers,
+  __ipcListeners: ipcListeners,
+  __eventBus: eventBus,
+  __windowStub: windowStub,
 }

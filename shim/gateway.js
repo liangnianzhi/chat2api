@@ -41,8 +41,6 @@ function shutdown(reason, exitCode) {
   if (shuttingDown) return
   shuttingDown = true
   console.log(`[supervisor] shutting down (${reason})`)
-  // The gateway installs its own SIGTERM handling to flush upstream's buffered
-  // log writers; re-raising gives it the chance to run.
   setTimeout(() => process.exit(exitCode == null ? 0 : exitCode), 4000).unref()
 }
 
@@ -78,8 +76,8 @@ if (ENABLE_FRONT) {
   if (!fs.existsSync(FRONT_ENTRY)) {
     console.error('[supervisor] front server not found at', FRONT_ENTRY, '- continuing without a UI')
   } else {
-    const publicPort = process.env.CHAT2API_PORT || '8080'
-    const internalPort = process.env.CHAT2API_INTERNAL_PORT || '18080'
+    const publicPort = process.env.CHAT2API_PORT || '8082'
+    const internalPort = process.env.CHAT2API_INTERNAL_PORT || '18090'
     if (publicPort === internalPort) {
       console.error('[supervisor] CHAT2API_PORT equals CHAT2API_INTERNAL_PORT - '
         + 'the front server and the gateway would fight for the same port.')

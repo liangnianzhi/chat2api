@@ -8,7 +8,8 @@
 #
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
-#   /v1、/v0、/health   -> 转发给回环上的网关进程
+#   /v1、/health        -> 转发给回环上的网关
+#   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
 #
 # 关键点：界面是**复用上游自己编译出来的前端**，不是重画的。shim 把上游注册的
 # 每个 ipcMain.handle 记下来，前端服务把浏览器的调用派发进去，因此所有页面和
@@ -108,7 +109,7 @@ RUN set -eux; \
 COPY shim/electron-shim.js /build/stage/shim/electron-shim.js
 COPY shim/gateway.js /build/stage/shim/gateway.js
 COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
-COPY webui/ /build/stage/webui/
+COPY webui/server.js /build/stage/webui/server.js
 
 RUN set -eux; \
     mkdir -p /build/stage/upstream; \
@@ -180,16 +181,16 @@ ENV NODE_ENV=production \
     CHAT2API_BUNDLE=/app/upstream/main/headless.js \
     CHAT2API_RENDERER_DIR=/app/upstream/renderer \
     CHAT2API_PRELOAD_FILE=/app/upstream/preload/index.js \
-    CHAT2API_PORT=8080 \
+    CHAT2API_PORT=8082 \
     CHAT2API_HOST=0.0.0.0 \
-    CHAT2API_INTERNAL_PORT=18080 \
+    CHAT2API_INTERNAL_PORT=18090 \
     CHAT2API_INTERNAL_HOST=127.0.0.1 \
     CHAT2API_ENABLE_WEBUI=true \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
 # 对外只暴露一个端口：上游界面和 API 共用
-EXPOSE 8080
+EXPOSE 8082
 
 # 不写 USER：entrypoint.sh 以 root 启动，先修正数据卷属主，再降权到 node 运行。
 # ENTRYPOINT 必须包含 entrypoint.sh，否则脚本根本不会被执行（CMD 只是它的参数）。

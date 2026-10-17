@@ -10,27 +10,35 @@
  *   POST /__ipc          -> dispatch into upstream's ipcMain.handle registry
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
  *   GET  /__preload.js   -> upstream's preload bundle, wrapped for the browser
- *   /v1/*, /v0/*, /health-> proxied to the gateway on loopback
+ *   /management/*        -> rewritten to /v0/management/* and proxied
+ *   /v1/*, /v0/*, /health, /stats -> proxied to the gateway on loopback
  *
  * WHY THE REAL RENDERER
  * ---------------------
  * Upstream's UI and all of its logic already exist. Rather than reimplement the
  * pages, the built renderer is served as-is and its IPC calls are bridged to the
- * very same handlers Electron would have called. Nothing about the UI is
- * duplicated, and it follows upstream automatically.
+ * very same handlers Electron would have called.
+ *
+ * MANAGEMENT PATH
+ * ---------------
+ * Upstream hardcodes /v0/management and matches it in several middlewares, so the
+ * prefix cannot be changed at the source. It also reads too close to OpenAI's
+ * /v1. This server therefore accepts /management/* and rewrites it to
+ * /v0/management/* before proxying: same behaviour, a name that cannot be
+ * confused. Both prefixes work; the docs use /management.
  *
  * WHY IN-PROCESS
  * --------------
- * The handler registry lives in the gateway process (the shim records it as
- * upstream registers). A separate process could not reach it, so gateway.js
- * requires this module instead of spawning it.
+ * The handler registry lives in this process (the shim records handlers as
+ * upstream registers them). A separate process could not reach it, so
+ * gateway.js requires this module instead of spawning it.
  *
  * THE BRIDGE IS NOT AUTHENTICATION
  * ---------------------------------
  * The management API requires a secret. This server attaches it server-side for
- * /v0/management/*, so the browser needs no credential and direct callers still
- * do - but, since the console and the API share a port, anyone who can reach the
- * port can administer. That is the accepted tradeoff of a single open address.
+ * management requests, so the browser needs no credential and direct callers
+ * still do - but, since the UI and the API share a port, anyone who can reach
+ * the port can administer. That is the accepted tradeoff of a single address.
  */
 
 'use strict'
@@ -43,16 +51,19 @@ const APP_DIR = process.env.CHAT2API_APP_DIR || path.join(__dirname, '..')
 const SHIM_PATH = process.env.CHAT2API_SHIM || path.join(APP_DIR, 'shim', 'electron-shim.js')
 const RENDERER_DIR = process.env.CHAT2API_RENDERER_DIR || path.join(APP_DIR, 'upstream', 'renderer')
 const PRELOAD_FILE = process.env.CHAT2API_PRELOAD_FILE || path.join(APP_DIR, 'upstream', 'preload', 'index.js')
-const FALLBACK_UI = process.env.CHAT2API_UI_FILE || path.join(__dirname, 'index.html')
 
-const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8080', 10)
+const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
 const GATEWAY = {
   host: process.env.CHAT2API_UI_UPSTREAM_HOST || '127.0.0.1',
-  port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18080', 10),
+  port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
 }
 const SECRET_FILE = process.env.CHAT2API_SECRET_FILE
   || path.join(process.env.CHAT2API_HOME || '/data/.chat2api', '.management-secret')
+
+// Upstream's own prefix, and the friendlier alias this server exposes.
+const UPSTREAM_MGMT = '/v0/management'
+const ALIAS_MGMT = '/management'
 
 /* ------------------------------------------------------------------ *
  * Bridge access (same process as the gateway)
@@ -72,7 +83,6 @@ function bridgeReady() {
 }
 
 // The shim emits one array argument per event, e.g. emit(channel, [a, b]).
-// EventEmitter has no wildcard, so wrap emit to fan out to a single stream.
 const streamClients = new Set()
 if (shim && shim.__eventBus) {
   const bus = shim.__eventBus
@@ -106,7 +116,7 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 }
 
-const API_PREFIXES = ['/v0/', '/v1/', '/api/']
+const API_PREFIXES = ['/v0/', '/v1/', '/api/', ALIAS_MGMT]
 
 /* ------------------------------------------------------------------ *
  * Console page
@@ -138,28 +148,23 @@ function injectConsoleHtml(html) {
   return out
 }
 
-function sendHtml(res, file, inject) {
-  fs.readFile(file, (err, buf) => {
-    if (err) {
-      console.error('[front] cannot read UI file:', file, err.message)
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
-      res.end('UI file missing: ' + file)
-      return
-    }
-    const html = inject ? injectConsoleHtml(buf.toString('utf8')) : buf
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-    res.end(html)
-  })
-}
-
 function serveIndex(res) {
   const upstreamIndex = path.join(RENDERER_DIR, 'index.html')
-  if (bridgeReady() && fs.existsSync(upstreamIndex)) {
-    sendHtml(res, upstreamIndex, true)
-  } else {
-    // No bridge (or no renderer build): the built-in console still works.
-    sendHtml(res, FALLBACK_UI, false)
-  }
+  fs.readFile(upstreamIndex, (err, buf) => {
+    if (err) {
+      // Deliberately loud: there is no fallback UI to hide behind.
+      console.error('[front] cannot read the upstream UI at', upstreamIndex, '-', err.message)
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end(
+        'The upstream UI is missing from this image.\n\n'
+        + `Expected: ${upstreamIndex}\n`
+        + 'The API on /v1 is unaffected. Rebuild the image, or report a bug.\n'
+      )
+      return
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(injectConsoleHtml(buf.toString('utf8')))
+  })
 }
 
 /* ------------------------------------------------------------------ *
@@ -319,8 +324,8 @@ async function handleIpc(req, res) {
   }
 
   try {
-    // Upstream handlers take (event, ...args). The event is only used for
-    // reply plumbing, which the HTTP round-trip replaces.
+    // Upstream handlers take (event, ...args). The event is only used for reply
+    // plumbing, which the HTTP round-trip replaces.
     const result = await handler({ sender: null, senderFrame: null }, ...args)
     send(200, { ok: true, result: result === undefined ? null : result })
   } catch (err) {
@@ -361,7 +366,6 @@ function handleEvents(req, res) {
 function serveStatic(res, urlPath) {
   const rel = decodeURIComponent(urlPath).replace(/^\/+/, '')
   const target = path.resolve(RENDERER_DIR, rel)
-  // Never serve outside the renderer directory.
   if (!target.startsWith(path.resolve(RENDERER_DIR) + path.sep)) return false
 
   let stat
@@ -387,11 +391,11 @@ function serveStatic(res, urlPath) {
  * ------------------------------------------------------------------ */
 function proxy(req, res, urlPath) {
   const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
+  const secret = readSecret()
 
-  // Only the management API needs the injected secret; /v1 passes through
+  // Only the management API needs the injected credential; /v1 passes through
   // untouched so client API keys keep working as usual.
-  if (urlPath.startsWith('/v0/management/')) {
-    const secret = readSecret()
+  if (urlPath.startsWith(UPSTREAM_MGMT) || urlPath.startsWith(ALIAS_MGMT)) {
     if (secret) {
       headers.authorization = `Bearer ${secret}`
     } else {
@@ -399,12 +403,19 @@ function proxy(req, res, urlPath) {
     }
   }
 
+  // /management/x -> /v0/management/x. Upstream matches the full prefix in
+  // several middlewares, so the rewrite is done here rather than at the source.
+  let targetPath = req.url
+  if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')) {
+    targetPath = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
+  }
+
   const upstream = http.request(
     {
       host: GATEWAY.host,
       port: GATEWAY.port,
       method: req.method,
-      path: req.url,
+      path: targetPath,
       headers,
     },
     (upRes) => {
@@ -439,18 +450,9 @@ function createServer() {
     if (urlPath === '/__ipc/events') { handleEvents(req, res); return }
     if (urlPath === '/__preload.js') { servePreload(res); return }
 
-    if (urlPath === '/_ui/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-      res.end(JSON.stringify({
-        status: 'ok',
-        ui: bridgeReady() && fs.existsSync(path.join(RENDERER_DIR, 'index.html')) ? 'upstream' : 'fallback',
-        channels: handlerCount(),
-      }))
-      return
-    }
-
     // API surface always proxies, so it never falls through to the SPA fallback.
-    if (urlPath === '/health' || API_PREFIXES.some((p) => urlPath.startsWith(p))) {
+    if (urlPath === '/health' || urlPath === '/stats'
+        || API_PREFIXES.some((p) => urlPath.startsWith(p))) {
       proxy(req, res, urlPath)
       return
     }
@@ -473,9 +475,13 @@ function start() {
   const server = createServer()
   server.listen(PUBLIC_PORT, PUBLIC_HOST, () => {
     console.log(`[front] listening on http://${PUBLIC_HOST}:${PUBLIC_PORT}`)
-    console.log(`[front] UI: ${bridgeReady() ? 'upstream renderer (IPC bridge active, '
-      + handlerCount() + ' channels)' : 'built-in fallback console'}`)
-    console.log(`[front] proxying /v1, /v0 and /health -> http://${GATEWAY.host}:${GATEWAY.port}`)
+    if (bridgeReady()) {
+      console.log(`[front] UI: upstream renderer, IPC bridge active (${handlerCount()} channels)`)
+    } else {
+      console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
+      console.warn('[front] The API on /v1 is unaffected. Check the log above for the cause.')
+    }
+    console.log(`[front] proxying /v1, /v0, /health and ${ALIAS_MGMT} -> http://${GATEWAY.host}:${GATEWAY.port}`)
   })
 
   const shutdown = (sig) => {
@@ -483,7 +489,7 @@ function start() {
     server.close(() => process.exit(0))
     setTimeout(() => process.exit(0), 3000).unref()
   }
-  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig))
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on('SIGINT' in process ? sig : sig, () => shutdown(sig))
 
   return server
 }

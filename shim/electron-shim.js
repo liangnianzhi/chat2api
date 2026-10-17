@@ -460,30 +460,33 @@ const powerMonitor = { on: () => {}, once: () => {}, off: () => {} }
  *
  * Registered into the handler map, and re-registered if upstream later claims
  * the channel. `error` is rendered verbatim by AddAccountDialog, so it carries
- * the instruction. A machine-readable `code` is included so tooling (and the
- * smoke test) can assert on something other than translated text.
+ * the instruction.
+ *
+ * loginPage is a ROOT-RELATIVE path, not an absolute URL. The server cannot know
+ * which host the user reached it by (LAN IP, hostname, reverse proxy), so any
+ * absolute URL it invents would be wrong for someone - 'localhost' would point at
+ * the visitor's own machine. The browser resolves a root-relative path against
+ * the origin it is already on.
  * ------------------------------------------------------------------ */
 const LOGIN_CHANNEL = 'oauth:startInAppLogin'
 
-function loginPageUrl(providerType, providerId) {
-  const base = process.env.CHAT2API_PUBLIC_BASE_URL
-    || `http://${process.env.CHAT2API_PUBLIC_HOST || 'localhost'}:${process.env.CHAT2API_PORT || '8082'}`
+function loginPagePath(providerType, providerId) {
   const params = new URLSearchParams({ provider: providerType, providerId: providerId })
-  return `${base}/__login?${params.toString()}`
+  return `/__login?${params.toString()}`
 }
 
 async function inAppLoginHandler(_event, data) {
   const providerType = (data && data.providerType) || (data && data.providerId) || ''
   const providerId = (data && data.providerId) || providerType
-  const url = loginPageUrl(providerType, providerId)
+  const relPath = loginPagePath(providerType, providerId)
 
-  console.log(`[shim] in-app login requested for ${providerType}; directing to ${url}`)
-  emitEvent('__c2a:openExternal', [url])
+  console.log(`[shim] in-app login requested for ${providerType}; directing to ${relPath}`)
+  emitEvent('__c2a:openExternal', [relPath])
 
   return {
     success: false,
     code: 'login_page_opened',
-    loginPage: url,
+    loginPage: relPath,
     providerId,
     providerType,
     error: '网页登录已改为「登录并粘贴凭证」：已打开登录页，请在其中完成登录后粘贴 token。',

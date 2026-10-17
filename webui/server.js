@@ -15,14 +15,11 @@
  *
  * NO SECOND PORT
  * --------------
- * Upstream's ProxyServer wants its own listen port. The shim intercepts that
- * bind (at http.Server.prototype.listen, see electron-shim.js) and publishes the
- * replayed request handler as __httpHandler. This module feeds requests straight
- * into it, so the container has one server on one port with no extra HTTP hop.
- *
- * The loopback path stays as a fallback: if the handler is missing (capture did
- * not happen, or upstream restructured), requests are proxied to the gateway's
- * own port so the API degrades rather than breaking.
+ * Upstream's ProxyServer expects to bind a port. The shim intercepts that bind
+ * and publishes the replayed request handler as __httpHandler; this module feeds
+ * requests straight into it. The proxy is configured for this same public port,
+ * so one number appears everywhere - config, the header badge, the management
+ * base URL and this server all agree on it.
  *
  * MANAGEMENT AUTH
  * ---------------
@@ -47,11 +44,6 @@ const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'pr
 // The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
-// Fallback only: used if the in-process handler is unavailable.
-const GATEWAY = {
-  host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
-  port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
-}
 const SECRET_FILE = process.env.CHAT2API_SECRET_FILE
   || path.join(process.env.CHAT2API_HOME || '/data/.chat2api', '.management-secret')
 
@@ -331,63 +323,47 @@ function prepareForGateway(req, urlPath) {
     console.warn('[front] management secret unavailable at', SECRET_FILE)
   }
 
-  // /management/x -> /v0/management/x. Upstream matches the full prefix in
-  // several middlewares, so the rewrite happens here rather than at the source.
+  // /management/x -> /v0/management/x.
   if (!urlPath.startsWith(UPSTREAM_MGMT)) {
     req.url = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
   }
 }
 
-function proxyToGateway(req, res) {
-  const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
-  const upstream = http.request(
-    {
-      host: GATEWAY.host,
-      port: GATEWAY.port,
-      method: req.method,
-      path: req.url,
-      headers,
-    },
-    (upRes) => {
-      res.writeHead(upRes.statusCode || 502, upRes.headers)
-      upRes.pipe(res)
-    }
-  )
-  upstream.on('error', (err) => {
-    console.error('[front] upstream error:', err.message)
-    if (res.headersSent) { res.end(); return }
-    res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({
-      error: {
-        message: `Cannot reach the gateway at ${GATEWAY.host}:${GATEWAY.port}: ${err.message}`,
-        type: 'upstream_unreachable',
-      },
-    }))
-  })
-  req.pipe(upstream)
-}
-
 /**
- * Hand the request to upstream's handler in-process.
+ * Hand the request to upstream's app in-process.
  *
- * Falls back to the loopback proxy when the handler is not available, which
- * covers the moment before the proxy binds and any surprise about its shape.
- * Either way the response is upstream's own.
+ * There is deliberately NO loopback fallback any more. The proxy is configured
+ * for this same port, so "retry over HTTP" would send the request back to this
+ * very server - an infinite loop. When the handler is missing the honest answer
+ * is an error.
  */
 function dispatch(req, res, urlPath) {
   prepareForGateway(req, urlPath)
 
   const handler = proxyHandler()
-  if (handler) {
-    try {
-      handler(req, res)
-      return
-    } catch (err) {
-      console.error('[front] in-process dispatch failed, falling back:', err && err.message)
-      if (res.headersSent) { res.end(); return }
-    }
+  if (!handler) {
+    console.error('[front] no proxy handler captured; cannot serve', urlPath)
+    res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({
+      error: {
+        message: 'The proxy handler is not available yet. Check the container log for '
+          + '"captured the HTTP request handler".',
+        type: 'proxy_unavailable',
+      },
+    }))
+    return
   }
-  proxyToGateway(req, res)
+
+  try {
+    handler(req, res)
+  } catch (err) {
+    console.error('[front] in-process dispatch failed:', err && err.message)
+    if (res.headersSent) { res.end(); return }
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({
+      error: { message: (err && err.message) || 'internal error', type: 'dispatch_failed' },
+    }))
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -429,10 +405,10 @@ function start() {
     } else {
       console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
     }
-    if (!proxyHandler()) {
-      console.log('[front] API: waiting for the proxy handler (falls back to loopback if it never arrives)')
-    } else {
+    if (proxyHandler()) {
       console.log('[front] API: served in-process, no second port')
+    } else {
+      console.warn('[front] API: no proxy handler yet; API calls get 503 until it is captured')
     }
   })
 

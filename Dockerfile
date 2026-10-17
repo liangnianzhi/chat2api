@@ -2,15 +2,14 @@
 # =============================================================================
 # 上游: https://github.com/wxs0625/Chat2API-WXS  (GPL-3.0)
 #
-# 只对外一个端口 8082：
+# 只对外一个端口 8082，且这是**唯一的端口号**：宿主、界面 Header、管理 API
+# 地址、/health 全都报它。代理本来会自己 bind 一个端口，shim 在那个 bind 处
+# 把它拦下来（不真正占用），所以不需要第二个端口号。
+#
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
-#   /v1、/health        -> 转发给网关
-#   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
-#
-# CHAT2API_INTERNAL_PORT 是容器内网关自身的监听地址，**不会发布到宿主**。
-# 之所以需要它：上游 ProxyServer 只能绑定一个监听端口，而 8082 必须由前端
-# 服务占用（界面 + IPC 桥）。所以内部拆成两段，宿主只看见 8082。
+#   /v1、/health        -> 上游 Koa 应用（OpenAI 兼容 API）
+#   /management/*      -> 改写成 /v0/management/* 后转发
 #
 # 源码获取
 # --------
@@ -127,7 +126,6 @@ RUN apk add --no-cache curl tini tzdata su-exec
 
 # 默认时区 Asia/Shanghai。
 # TZ 与 /etc/localtime 都设置：有的程序读环境变量，有的读时区文件。
-# 如需覆盖，在 compose 里设 TZ 即可。
 ENV TZ=Asia/Shanghai
 RUN set -eux; \
     ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime; \
@@ -176,13 +174,14 @@ ENV NODE_ENV=production \
     CHAT2API_BRIDGE_FILE=/app/webui/preload-bridge.js \
     CHAT2API_PORT=8082 \
     CHAT2API_HOST=0.0.0.0 \
-    CHAT2API_INTERNAL_PORT=18090 \
-    CHAT2API_INTERNAL_HOST=127.0.0.1 \
+    CHAT2API_INTERNAL_PORT=8082 \
+    CHAT2API_INTERNAL_HOST=0.0.0.0 \
+    CHAT2API_INTERCEPT_PORTS=8082,18090 \
     CHAT2API_ENABLE_WEBUI=true \
     NODE_OPTIONS=--max-old-space-size=256
 
 VOLUME ["/data"]
-# 唯一对外端口。CHAT2API_INTERNAL_PORT 只在容器内使用，不在此暴露。
+# 唯一对外端口（也是唯一的端口号）
 EXPOSE 8082
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

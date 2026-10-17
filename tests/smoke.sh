@@ -7,16 +7,15 @@
 #
 #   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
-# No secrets are provisioned: deployment is zero-config, so the suite asserts
-# that the console works with no credentials while the gateway API stays
-# protected behind the secret the container generated for itself.
+# Deployment is zero-config and single-port: no secrets to provision, and the
+# console, the OpenAI routes and the management API are all reached through the
+# same address.
 
 set -uo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
 CONTAINER="${CONTAINER:-chat2api-smoke}"
-API_PORT="${API_PORT:-18080}"
-UI_PORT="${UI_PORT:-18081}"
+PORT="${PORT:-18080}"
 SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-250}"
 WORKDIR="$(mktemp -d)"
 
@@ -33,8 +32,6 @@ info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 cleanup() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  # The container writes into the bind mount as uid 1000, which the runner user
-  # may not be able to remove directly.
   if command -v sudo >/dev/null 2>&1; then
     sudo rm -rf "$WORKDIR" 2>/dev/null || rm -rf "$WORKDIR" 2>/dev/null || true
   else
@@ -46,15 +43,14 @@ trap cleanup EXIT
 start_container() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$CONTAINER" \
-    -p "127.0.0.1:${API_PORT}:8080" \
-    -p "127.0.0.1:${UI_PORT}:8081" \
+    -p "127.0.0.1:${PORT}:8080" \
     -v "$WORKDIR/data:/data" \
     "$IMAGE" >/dev/null
 }
 
 wait_ready() {
   for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${API_PORT}/health" >/dev/null 2>&1; then return 0; fi
+    if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
   return 1
@@ -66,7 +62,6 @@ in_container() { docker exec "$CONTAINER" sh -c "$1" 2>&1; }
 info "准备：宿主目录属主故意设错，验证容器能自愈"
 # ---------------------------------------------------------------------------
 mkdir -p "$WORKDIR/data"
-# 宿主普通用户创建的目录通常不是 uid 1000；entrypoint 必须自行修正。
 chown "$(id -u):$(id -g)" "$WORKDIR/data" 2>/dev/null || true
 start_container
 
@@ -86,13 +81,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-info "无头运行与管理台启动"
+info "无头运行与单端口布局"
 # ---------------------------------------------------------------------------
 LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
 grep -q 'electron shim active' <<<"$LOGS" \
   && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
-grep -q 'management console listening' <<<"$LOGS" \
-  && pass "Web 管理台已监听" || fail "Web 管理台未启动"
+grep -q '\[front\] listening' <<<"$LOGS" \
+  && pass "单一入口服务已监听" || fail "前端服务未启动"
+grep -q 'gateway listening on 127.0.0.1' <<<"$LOGS" \
+  && pass "网关只监听回环（不对外暴露第二个端口）" \
+  || fail "网关未按预期绑定 127.0.0.1"
 
 if docker run --rm --entrypoint sh "$IMAGE" \
      -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
@@ -104,16 +102,13 @@ fi
 # ---------------------------------------------------------------------------
 info "主进程已降权"
 # ---------------------------------------------------------------------------
-# 不能用 `docker exec id -u`：镜像没有设置 USER，exec 默认以 root 进入，
-# 那只反映 exec 的身份，与主进程无关。改看运行时产物的属主——文件由网关进程
-# 写入，属主即该进程的 uid，这才是降权真正生效的证据。
+# docker exec 默认以 root 进入（镜像未设 USER），那只反映 exec 的身份。
+# 改看运行时产物属主：文件由网关进程写入，属主即其 uid。
 SECRET_FILE="/data/.chat2api/.management-secret"
 RUNTIME_OWNER="$(in_container "stat -c '%u' $SECRET_FILE" | tr -d '\r\n')"
-if [ "$RUNTIME_OWNER" = "1000" ]; then
-  pass "运行时文件属主为 1000（主进程已降权到 node）"
-else
-  fail "运行时文件属主为 $RUNTIME_OWNER，预期 1000"
-fi
+[ "$RUNTIME_OWNER" = "1000" ] \
+  && pass "运行时文件属主为 1000（主进程已降权到 node）" \
+  || fail "运行时文件属主为 $RUNTIME_OWNER，预期 1000"
 
 # ---------------------------------------------------------------------------
 info "上游 wasm 依赖（DeepSeek/GLM 签名）"
@@ -127,29 +122,32 @@ const f = path.join(p, "sha3_wasm_bg.7b9ca65ddd.wasm");
 if (!fs.existsSync(f)) { console.error("wasm missing at " + f); process.exit(1) }
 console.log("ok");
 ' 2>&1)"
-if grep -q '^ok$' <<<"$WASM_OUT"; then
-  pass "process.resourcesPath 可用且能定位 wasm"
-else
-  fail "wasm 路径解析失败：$WASM_OUT"
-fi
+grep -q '^ok$' <<<"$WASM_OUT" \
+  && pass "process.resourcesPath 可用且能定位 wasm" \
+  || fail "wasm 路径解析失败：$WASM_OUT"
 
 # ---------------------------------------------------------------------------
-info "OpenAI 兼容 API"
+info "同一端口上的两个 API"
 # ---------------------------------------------------------------------------
-HEALTH="$(curl -fsS "http://127.0.0.1:${API_PORT}/health" || echo '')"
+HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health" || echo '')"
 grep -q '"status":"running"' <<<"$HEALTH" \
   && pass "/health 返回 running" || fail "/health 异常: $HEALTH"
 
-MODELS="$(curl -fsS "http://127.0.0.1:${API_PORT}/v1/models" || echo '')"
+MODELS="$(curl -fsS "http://127.0.0.1:${PORT}/v1/models" || echo '')"
 grep -q '"object":"list"' <<<"$MODELS" \
-  && pass "/v1/models 返回 OpenAI 格式" || fail "/v1/models 异常: $MODELS"
+  && pass "/v1/models 经同一端口返回 OpenAI 格式" || fail "/v1/models 异常: $MODELS"
+
+CODE_MGMT="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v0/management/accounts")"
+[ "$CODE_MGMT" = 200 ] \
+  && pass "/v0/management 经同一端口可用（服务端已注入密钥）" \
+  || fail "/v0/management 应返回 200，实际 $CODE_MGMT"
 
 # ---------------------------------------------------------------------------
-info "管理台：无需任何登录"
+info "管理台页面"
 # ---------------------------------------------------------------------------
-UI_HTML="$(curl -fsS "http://127.0.0.1:${UI_PORT}/" || echo '')"
+UI_HTML="$(curl -fsS "http://127.0.0.1:${PORT}/" || echo '')"
 grep -q 'Chat2API 管理台' <<<"$UI_HTML" \
-  && pass "管理台页面可访问" || fail "管理台页面内容异常"
+  && pass "根路径返回管理台页面" || fail "管理台页面内容异常"
 
 # 按元素判定，不按文案——页面里可能有提到密钥的注释/说明文字。
 if grep -q 'id="secret"' <<<"$UI_HTML"; then
@@ -158,54 +156,28 @@ else
   pass "页面上没有登录/密钥输入"
 fi
 
-CODE_UI_ACC="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_PORT}/v0/management/accounts")"
-[ "$CODE_UI_ACC" = 200 ] \
-  && pass "管理台代理无需凭据即返回 200（服务端已注入密钥）" \
-  || fail "管理台代理应返回 200，实际 $CODE_UI_ACC"
-
-CODE_RELAY="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_PORT}/v1/models")"
-[ "$CODE_RELAY" = 404 ] \
-  && pass "管理台拒绕非白名单路径（/v1/models -> 404）" \
-  || fail "白名单外路径应 404，实际 $CODE_RELAY"
-
 # ---------------------------------------------------------------------------
-info "网关 API：仍然受密钥保护"
+info "生成的密钥"
 # ---------------------------------------------------------------------------
-CODE_API_NOAUTH="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${API_PORT}/v0/management/accounts")"
-[ "$CODE_API_NOAUTH" = 401 ] \
-  && pass "直连 8080 无凭据 -> 401" \
-  || fail "直连 8080 无凭据应 401，实际 $CODE_API_NOAUTH"
-
 SECRET="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
-if [ -n "$SECRET" ]; then
-  pass "密钥已生成并写入 $SECRET_FILE"
-else
-  fail "未找到生成的密钥文件"
-fi
+[ -n "$SECRET" ] \
+  && pass "密钥已生成并写入 $SECRET_FILE" || fail "未找到生成的密钥文件"
 
 MODE="$(in_container "stat -c '%a' $SECRET_FILE" | tr -d '\r\n')"
 [ "$MODE" = 600 ] \
   && pass "密钥文件权限为 600" || fail "密钥文件权限为 $MODE，预期 600"
 
-if [ -n "$SECRET" ]; then
-  CODE_API_AUTH="$(curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $SECRET" "http://127.0.0.1:${API_PORT}/v0/management/accounts")"
-  [ "$CODE_API_AUTH" = 200 ] \
-    && pass "直连 8080 带正确密钥 -> 200" \
-    || fail "直连 8080 带正确密钥应 200，实际 $CODE_API_AUTH"
-fi
-
 # ---------------------------------------------------------------------------
-info "账号写入与读取（经管理台）"
+info "账号写入与读取"
 # ---------------------------------------------------------------------------
-CREATE="$(curl -fsS -X POST "http://127.0.0.1:${UI_PORT}/v0/management/accounts" \
+CREATE="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v0/management/accounts" \
   -H 'Content-Type: application/json' \
   -d '{"providerId":"deepseek","name":"smoke-account","credentials":{"token":"smoke-token-value"}}' \
   || echo '')"
 grep -q '"success":true' <<<"$CREATE" \
   && pass "添加账号成功" || fail "添加账号失败: $CREATE"
 
-LIST="$(curl -fsS "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '')"
+LIST="$(curl -fsS "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$LIST" \
   && pass "账号出现在列表中" || fail "列表中未找到新账号: $LIST"
 
@@ -215,7 +187,7 @@ grep -q 'smoke-token-value' <<<"$LIST" \
 # ---------------------------------------------------------------------------
 info "客户端 API 密钥"
 # ---------------------------------------------------------------------------
-KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${UI_PORT}/v0/management/api-keys" \
+KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v0/management/api-keys" \
   -H 'Content-Type: application/json' \
   -d '{"name":"smoke-client"}' || echo '')"
 grep -q 'sk-mgmt-' <<<"$KEYRESP" \
@@ -237,11 +209,9 @@ try {
 } catch {}
 console.log("ok");
 ' 2>&1)"
-if grep -q '^ok$' <<<"$CRYPTO_OUT"; then
-  pass "加解密往返、无明文泄露、篡改可检测"
-else
-  fail "凭证加密自检失败：$CRYPTO_OUT"
-fi
+grep -q '^ok$' <<<"$CRYPTO_OUT" \
+  && pass "加解密往返、无明文泄露、篡改可检测" \
+  || fail "凭证加密自检失败：$CRYPTO_OUT"
 
 if docker exec "$CONTAINER" test -f /data/.chat2api/.safe-storage-key; then
   pass "加密密钥持久化在数据卷"
@@ -263,7 +233,7 @@ info "重启后持久化"
 docker restart "$CONTAINER" >/dev/null
 if wait_ready; then pass "重启后容器就绪"; else fail "重启后容器未就绪"; fi
 
-AFTER="$(curl -fsS "http://127.0.0.1:${UI_PORT}/v0/management/accounts" || echo '')"
+AFTER="$(curl -fsS "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$AFTER" \
   && pass "重启后账号仍在" || fail "重启后账号丢失: $AFTER"
 

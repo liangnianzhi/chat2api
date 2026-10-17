@@ -153,6 +153,7 @@ RUN set -eux; \
     test -f /app/upstream/main/headless.js; \
     test -f /app/webui/server.js; \
     test -f /app/shim/gateway.js; \
+    test -x /app/shim/entrypoint.sh; \
     chown -R node:node /app; \
     echo '运行时布局就绪'
 
@@ -171,10 +172,10 @@ ENV NODE_ENV=production \
 VOLUME ["/data"]
 EXPOSE 8080 8081
 
-# 不写 USER：entrypoint.sh 需要 root 修正数据卷属主，随后降权到 node 运行。
-# HEALTHCHECK 打在网关自身的 /health（管理台是可选组件，不影响健康判定）。
+# 不写 USER：entrypoint.sh 以 root 启动，先修正数据卷属主，再降权到 node 运行。
+# ENTRYPOINT 必须包含 entrypoint.sh，否则脚本根本不会被执行（CMD 只是它的参数）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
 
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/sbin/tini", "--", "/app/shim/entrypoint.sh"]
 CMD ["node", "/app/shim/gateway.js"]

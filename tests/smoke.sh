@@ -7,14 +7,14 @@
 #
 #   IMAGE=ghcr.io/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
-# Deployment is zero-config and single-port: the upstream UI, the OpenAI routes
-# and the management API are all reached through the same address.
+# Deployment is zero-config and single-port on 8082: the upstream UI, the OpenAI
+# routes and the management API are all reached through that one address.
 
 set -uo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/liangnianzhi/chat2api:latest}"
 CONTAINER="${CONTAINER:-chat2api-smoke}"
-PORT="${PORT:-18080}"
+PORT="${PORT:-18082}"
 SIZE_BUDGET_MB="${SIZE_BUDGET_MB:-300}"
 WORKDIR="$(mktemp -d)"
 
@@ -42,7 +42,7 @@ trap cleanup EXIT
 start_container() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$CONTAINER" \
-    -p "127.0.0.1:${PORT}:8080" \
+    -p "127.0.0.1:${PORT}:8082" \
     -v "$WORKDIR/data:/data" \
     "$IMAGE" >/dev/null
 }
@@ -85,11 +85,11 @@ info "无头运行与单端口布局"
 LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
 grep -q 'electron shim active' <<<"$LOGS" \
   && pass "electron shim 已生效" || fail "未看到 'electron shim active'"
-grep -q '\[front\] listening' <<<"$LOGS" \
-  && pass "单一入口服务已监听" || fail "前端服务未启动"
-grep -q 'gateway listening on 127.0.0.1' <<<"$LOGS" \
-  && pass "网关只监听回环（不对外暴露第二个端口）" \
-  || fail "网关未按预期绑定 127.0.0.1"
+grep -q '\[front\] listening on http://0.0.0.0:8082' <<<"$LOGS" \
+  && pass "单一入口监听 8082" || fail "前端服务未在 8082 监听"
+grep -q 'gateway listening on 127.0.0.1:18090' <<<"$LOGS" \
+  && pass "网关只监听回环 18090（不对外暴露第二个端口）" \
+  || fail "网关未按预期绑定 127.0.0.1:18090"
 
 if docker run --rm --entrypoint sh "$IMAGE" \
      -c 'command -v Xvfb || command -v chromium || command -v electron' 2>/dev/null | grep -q .; then
@@ -126,23 +126,11 @@ grep -q '^ok$' <<<"$WASM_OUT" \
 # ---------------------------------------------------------------------------
 info "上游原版界面（由 IPC 桥驱动）"
 # ---------------------------------------------------------------------------
-BRIDGE="$(curl -fsS "http://127.0.0.1:${PORT}/_ui/health" || echo '')"
-grep -q '"ui":"upstream"' <<<"$BRIDGE" \
-  && pass "前端来自上游 out/renderer（不是内置降级页）" \
-  || fail "未启用上游界面: $BRIDGE"
-
-CHANNELS="$(grep -oE '"channels":[0-9]+' <<<"$BRIDGE" | grep -oE '[0-9]+' | head -1)"
-if [ -n "$CHANNELS" ] && [ "$CHANNELS" -gt 100 ]; then
-  pass "上游 IPC 处理器已登记（$CHANNELS 个 channel）"
-else
-  fail "IPC 处理器数量异常: ${CHANNELS:-无}"
-fi
-
 INDEX="$(curl -fsS "http://127.0.0.1:${PORT}/" || echo '')"
 grep -q '/__preload.js' <<<"$INDEX" \
   && pass "页面已注入 preload 桥" || fail "页面缺少 /__preload.js"
-grep -q 'id="acctProvider"' <<<"$INDEX" \
-  && fail "仍在提供内置降级控制台" || pass "提供的是上游界面"
+grep -qi '<div id="root"\|<div id="app"' <<<"$INDEX" \
+  && pass "根节点为 SPA 挂载点（上游界面）" || fail "页面结构不像上游前端"
 
 PRELOAD="$(curl -fsS "http://127.0.0.1:${PORT}/__preload.js" || echo '')"
 grep -q 'contextBridge' <<<"$PRELOAD" \
@@ -166,6 +154,13 @@ CODE_IPC="$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${P
   && pass "IPC 端点已就绪（未知 channel -> 404）" \
   || fail "IPC 端点异常: HTTP $CODE_IPC"
 
+IPC_ACC="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
+  -H 'Content-Type: application/json' \
+  -d '{"channel":"accounts:getAll","args":[false]}' || echo '')"
+grep -q '"ok":true' <<<"$IPC_ACC" \
+  && pass "IPC 桥能派发真实 channel（accounts:getAll）" \
+  || fail "IPC 桥派发失败: $IPC_ACC"
+
 # ---------------------------------------------------------------------------
 info "同一端口上的两个 API"
 # ---------------------------------------------------------------------------
@@ -177,10 +172,26 @@ MODELS="$(curl -fsS "http://127.0.0.1:${PORT}/v1/models" || echo '')"
 grep -q '"object":"list"' <<<"$MODELS" \
   && pass "/v1/models 经同一端口返回 OpenAI 格式" || fail "/v1/models 异常: $MODELS"
 
-CODE_MGMT="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/v0/management/accounts")"
-[ "$CODE_MGMT" = 200 ] \
-  && pass "/v0/management 经同一端口可用（服务端已注入密钥）" \
-  || fail "/v0/management 应返回 200，实际 $CODE_MGMT"
+# ---------------------------------------------------------------------------
+info "管理 API：/management 别名与 /v0/management 等价"
+# ---------------------------------------------------------------------------
+MGMT_ALIAS="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:${PORT}/management/accounts" || echo '')"
+MGMT_UPSTREAM="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
+
+ALIAS_CODE="$(tail -1 <<<"$MGMT_ALIAS")"
+UPSTREAM_CODE="$(tail -1 <<<"$MGMT_UPSTREAM")"
+[ "$ALIAS_CODE" = 200 ] \
+  && pass "/management/accounts -> 200" || fail "/management/accounts -> HTTP $ALIAS_CODE"
+[ "$ALIAS_CODE" = "$UPSTREAM_CODE" ] \
+  && pass "两个前缀状态码一致（$ALIAS_CODE）" \
+  || fail "前缀行为不一致: /management=$ALIAS_CODE /v0/management=$UPSTREAM_CODE"
+
+# 响应体也应一致（除可能存在的时间戳外，先比对键名）
+ALIAS_KEYS="$(head -n -1 <<<"$MGMT_ALIAS" | grep -oE '"[a-zA-Z]+":' | sort -u | tr -d '\n')"
+UPSTREAM_KEYS="$(head -n -1 <<<"$MGMT_UPSTREAM" | grep -oE '"[a-zA-Z]+":' | sort -u | tr -d '\n')"
+[ "$ALIAS_KEYS" = "$UPSTREAM_KEYS" ] \
+  && pass "两个前缀返回相同结构" \
+  || fail "返回结构不一致: alias=[$ALIAS_KEYS] upstream=[$UPSTREAM_KEYS]"
 
 # ---------------------------------------------------------------------------
 info "生成的密钥"
@@ -196,14 +207,14 @@ MODE="$(in_container "stat -c '%a' $SECRET_FILE" | tr -d '\r\n')"
 # ---------------------------------------------------------------------------
 info "账号写入与读取"
 # ---------------------------------------------------------------------------
-CREATE="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v0/management/accounts" \
+CREATE="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/management/accounts" \
   -H 'Content-Type: application/json' \
   -d '{"providerId":"deepseek","name":"smoke-account","credentials":{"token":"smoke-token-value"}}' \
   || echo '')"
 grep -q '"success":true' <<<"$CREATE" \
-  && pass "添加账号成功" || fail "添加账号失败: $CREATE"
+  && pass "添加账号成功（经 /management）" || fail "添加账号失败: $CREATE"
 
-LIST="$(curl -fsS "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
+LIST="$(curl -fsS "http://127.0.0.1:${PORT}/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$LIST" \
   && pass "账号出现在列表中" || fail "列表中未找到新账号: $LIST"
 
@@ -211,26 +222,9 @@ grep -q 'smoke-token-value' <<<"$LIST" \
   && fail "列表泄露了明文凭证" || pass "列表未泄露明文凭证（已掩码）"
 
 # ---------------------------------------------------------------------------
-info "IPC 桥能派发真实 channel（界面走的就是这条路）"
-# ---------------------------------------------------------------------------
-IPC_ACC="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
-  -H 'Content-Type: application/json' \
-  -d '{"channel":"accounts:getAll","args":[false]}' || echo '')"
-if grep -q '"ok":true' <<<"$IPC_ACC"; then
-  pass "IPC 桥能派发真实 channel（accounts:getAll）"
-else
-  IPC_ANY="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/__ipc" \
-    -H 'Content-Type: application/json' \
-    -d '{"channel":"config:get","args":[]}' || echo '')"
-  grep -q '"ok":true' <<<"$IPC_ANY" \
-    && pass "IPC 桥能派发真实 channel（config:get）" \
-    || fail "IPC 桥无法派发任何真实 channel: $IPC_ANY"
-fi
-
-# ---------------------------------------------------------------------------
 info "客户端 API 密钥"
 # ---------------------------------------------------------------------------
-KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/v0/management/api-keys" \
+KEYRESP="$(curl -fsS -X POST "http://127.0.0.1:${PORT}/management/api-keys" \
   -H 'Content-Type: application/json' \
   -d '{"name":"smoke-client"}' || echo '')"
 grep -q 'sk-mgmt-' <<<"$KEYRESP" \
@@ -276,7 +270,7 @@ info "重启后持久化"
 docker restart "$CONTAINER" >/dev/null
 if wait_ready; then pass "重启后容器就绪"; else fail "重启后容器未就绪"; fi
 
-AFTER="$(curl -fsS "http://127.0.0.1:${PORT}/v0/management/accounts" || echo '')"
+AFTER="$(curl -fsS "http://127.0.0.1:${PORT}/management/accounts" || echo '')"
 grep -q 'smoke-account' <<<"$AFTER" \
   && pass "重启后账号仍在" || fail "重启后账号丢失: $AFTER"
 

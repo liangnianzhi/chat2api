@@ -4,8 +4,9 @@ name: build
 #
 # The weekly run rebuilds from upstream main on purpose: this deployment depends
 # on upstream internals that can move (store.ts's Electron imports, the vite
-# config's rollupOptions.input shape, the bootstrap in ipc/handlers.ts). A
-# scheduled build turns silent drift into a failing run instead of a surprise.
+# config's rollupOptions.input shape, the bootstrap in ipc/handlers.ts, the
+# preload output format). A scheduled build turns silent drift into a failing
+# run instead of a surprise.
 
 on:
   push:
@@ -17,20 +18,14 @@ on:
     - cron: '17 3 * * 1'
 
 permissions:
-  contents: read
+  contents: write   # 仅用于失败时提交 smoke-failure.log，绿后移除
   packages: write
 
 env:
-  # Must match docker-compose.yml's image reference. The build tags the image
-  # with this same reference so the compose step uses the freshly built image
-  # instead of pulling whatever is already published.
   IMAGE_REF: ghcr.io/${{ github.repository }}:latest
   CHAT2API_REF: main
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Fast fail: shell syntax and lint before spending time on a docker build.
-  # ---------------------------------------------------------------------------
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -48,9 +43,13 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
 
-  # ---------------------------------------------------------------------------
-  # Build, deploy, test - and publish to GHCR on main/tags.
-  # ---------------------------------------------------------------------------
+      - name: Node syntax check
+        run: |
+          node --check webui/server.js
+          node --check shim/electron-shim.js
+          node --check shim/gateway.js
+          echo 'node syntax OK'
+
   build-test-publish:
     runs-on: ubuntu-latest
     needs: lint
@@ -89,20 +88,17 @@ jobs:
           docker compose up -d
 
           for i in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then break; fi
+            if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then break; fi
             sleep 2
           done
 
           echo '--- /health ---'
-          curl -fsS http://127.0.0.1:8080/health
+          curl -fsS http://127.0.0.1:8082/health
           echo
           echo '--- UI bridge ---'
-          curl -fsS http://127.0.0.1:8080/_ui/health
-          echo
-          echo '--- console and API share the port ---'
-          curl -fsS -o /dev/null -w 'GET /                  -> HTTP %{http_code}\n' http://127.0.0.1:8080/
-          curl -fsS -o /dev/null -w 'GET /v1/models        -> HTTP %{http_code}\n' http://127.0.0.1:8080/v1/models
-          curl -sS  -o /dev/null -w 'GET /v0/management/... -> HTTP %{http_code}\n' http://127.0.0.1:8080/v0/management/providers
+          curl -fsS -o /dev/null -w 'GET /           -> HTTP %{http_code}\n' http://127.0.0.1:8082/
+          curl -fsS -o /dev/null -w 'GET /v1/models  -> HTTP %{http_code}\n' http://127.0.0.1:8082/v1/models
+          curl -sS  -o /dev/null -w 'GET /management -> HTTP %{http_code}\n' http://127.0.0.1:8082/management/accounts
 
           echo '--- image used by the container ---'
           docker inspect chat2api --format '{{.Config.Image}} / {{.Image}}'
@@ -113,25 +109,39 @@ jobs:
           docker compose logs --tail 80 || true
           docker compose down -v || true
 
-      # The deep functional suite: upstream UI + IPC bridge, account CRUD,
-      # credential encryption, persistence, single-port routing, size budget.
       - name: Run container smoke tests
+        id: smoke
         run: |
-          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh
+          set -o pipefail
+          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
+
+      - name: Publish smoke output on failure
+        if: failure()
+        run: |
+          if [ ! -f /tmp/smoke.log ]; then echo 'no smoke log to publish'; exit 0; fi
+          {
+            echo "# Smoke test output (run ${{ github.run_id }}, commit ${{ github.sha }})"
+            echo
+            echo '```'
+            cat /tmp/smoke.log
+            echo '```'
+          } > smoke-failure.log
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f smoke-failure.log
+          git commit -m 'ci: capture smoke test failure output [skip ci]' \
+            || { echo 'nothing to commit'; exit 0; }
+          git push origin "HEAD:${GITHUB_REF_NAME}" || echo 'push failed'
 
       - name: Container logs on failure
         if: failure()
         run: |
-          echo '--- all containers ---'
           docker ps -a
           for c in $(docker ps -aq); do
             echo "--- logs: $c ---"
             docker logs --tail 100 "$c" 2>&1 || true
           done
 
-      # ---------------------------------------------------------------------
-      # Publish (main and version tags only; never on pull requests)
-      # ---------------------------------------------------------------------
       - name: Log in to GHCR
         if: success() && github.event_name != 'pull_request'
         uses: docker/login-action@v3

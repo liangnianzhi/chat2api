@@ -6,7 +6,7 @@
 #   GET /              -> 上游原版前端界面（out/renderer）
 #   POST /__ipc        -> 把界面的 IPC 调用派发给上游自己的 ipcMain.handle
 #   /v1、/health        -> 转发给网关
-#   /management/*      -> 改写成 /v0/management/* 后转发
+#   /management/*      -> 改写成 /v0/management/* 后转发（更好记的管理入口）
 #
 # CHAT2API_INTERNAL_PORT 是容器内网关自身的监听地址，**不会发布到宿主**。
 # 之所以需要它：上游 ProxyServer 只能绑定一个监听端口，而 8082 必须由前端
@@ -122,16 +122,17 @@ LABEL org.opencontainers.image.title="chat2api" \
       org.opencontainers.image.licenses="GPL-3.0"
 
 # curl 用于健康检查；tini 回收子进程并转发信号；su-exec 用于降权；
-# tzdata 提供时区数据。
+# tzdata 提供时区数据（默认时区见下方）。
 RUN apk add --no-cache curl tini tzdata su-exec
 
 # 默认时区 Asia/Shanghai。
-# 同时设 TZ 和 /etc/localtime：有的程序看环境变量，有的看时区文件。
+# TZ 与 /etc/localtime 都设置：有的程序读环境变量，有的读时区文件。
+# 如需覆盖，在 compose 里设 TZ 即可。
 ENV TZ=Asia/Shanghai
 RUN set -eux; \
     ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime; \
     echo "${TZ}" > /etc/timezone; \
-    date
+    echo "timezone: $(date '+%Z %z')"
 
 # node 官方镜像已有 uid/gid 1000（node），复用它以免 addgroup -g 1000 冲突。
 # Alpine 无 usermod，用 awk 改 /etc/passwd 第 6、7 字段并校验仍是 7 段。

@@ -60,9 +60,9 @@ const DATA_DIR = process.env.CHAT2API_HOME || join(process.env.HOME || '/data', 
 const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
-  // The proxy listens on loopback only. The front server owns the single public
-  // port (8082) and proxies here, so the UI and the API share one address - the
-  // way the desktop app presented them.
+  // The proxy listens on this address. The shim captures the bind and hands the
+  // request handler to the front server, so this port is never actually opened -
+  // it only has to match what the shim expects to intercept.
   port: envInt('CHAT2API_INTERNAL_PORT', 18090),
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   apiKey: process.env.CHAT2API_API_KEY || '',
@@ -76,7 +76,6 @@ const CONFIG = {
 }
 
 console.log('[headless] Chat2API starting')
-console.log('[headless] gateway listening on', `${CONFIG.host}:${CONFIG.port}`)
 
 /**
  * Publish the effective management secret where the front server can read it.
@@ -186,47 +185,55 @@ async function reconcileConfig(): Promise<void> {
 /* ------------------------------------------------------------------ *
  * Proxy startup
  *
- * Preferred path: register upstream's IPC handlers, which both wires the whole
- * renderer-facing API surface and starts the proxy (autoStartProxy above). The
- * fallback exists because those handlers pull in tray / updater / oauth code; if
- * any of it cannot initialise headlessly we still serve the API, just without
- * the UI bridge (the UI then reports its failure instead of pretending).
+ * READINESS IS THE CAPTURED HANDLER, NOT proxyStatusManager
+ * ---------------------------------------------------------
+ * A previous version polled getProxyStatus().isRunning and, when it never became
+ * true, constructed a second ProxyServer as a fallback. That was actively
+ * harmful: the second instance's start()/stop() cycle left SessionManager torn
+ * down and proxyStatusManager reporting 'stopped' while requests were being
+ * served - so /health said stopped and the UI showed the proxy as stopped.
+ *
+ * The signal that actually matters is the shim's captured request handler: if it
+ * exists, upstream is serving and nothing else needs to happen.
  * ------------------------------------------------------------------ */
-interface ProxyStatusLike { isRunning: boolean; port?: number; host?: string }
-
 async function startProxy(): Promise<void> {
   const windowStub = (electron as any).__windowStub
-  let upstreamStatus: (() => ProxyStatusLike) | null = null
+  const httpHandler = (electron as any).__httpHandler as (() => unknown) | undefined
+
+  const captured = (): boolean => {
+    try {
+      return typeof httpHandler === 'function' && httpHandler() !== null
+    } catch {
+      return false
+    }
+  }
 
   try {
     const mod = await import('./ipc/handlers')
     await mod.registerIpcHandlers(windowStub)
-    upstreamStatus = mod.getProxyStatus as () => ProxyStatusLike
     console.log('[headless] IPC bridge registered - the UI can drive this process')
   } catch (err) {
     console.error('[headless] IPC bridge unavailable, serving the API without it:')
     console.error(err instanceof Error ? err.stack : err)
   }
 
-  if (upstreamStatus) {
-    for (let i = 0; i < 40; i++) {
-      try {
-        if (upstreamStatus().isRunning) {
-          console.log('[headless] proxy started via upstream handler')
-          return
-        }
-      } catch {
-        break
-      }
-      await sleep(250)
+  // registerIpcHandlers starts the proxy because autoStartProxy is set. Wait for
+  // the shim to capture the bind rather than inspecting proxy status.
+  for (let i = 0; i < 80; i++) {
+    if (captured()) {
+      console.log('[headless] proxy serving via the captured handler')
+      return
     }
-    console.warn('[headless] upstream did not report a running proxy; starting directly')
+    await sleep(250)
   }
 
+  // Nothing captured: the handlers could not start the proxy. This is the only
+  // case where starting one directly is correct.
+  console.warn('[headless] no handler captured; starting the proxy directly')
   const server = new ProxyServer()
   const ok = await server.start(CONFIG.port, CONFIG.host)
   if (!ok) {
-    console.error(`[headless] FATAL: proxy failed to listen on ${CONFIG.host}:${CONFIG.port}`)
+    console.error(`[headless] FATAL: proxy failed to start on ${CONFIG.host}:${CONFIG.port}`)
     process.exit(1)
   }
 

@@ -113,13 +113,18 @@ const safeStorage = {
 /* ------------------------------------------------------------------ *
  * Single port capture
  *
- * Upstream's ProxyServer owns a Koa app and calls `app.listen(port, host)` to
- * serve it. That would give the container a second listening port.
+ * Upstream's ProxyServer owns a Koa app and calls
+ * `app.listen(port, host, callback)` to serve it. That would give the container
+ * a second listening port.
  *
- * Instead, the first `listen()` on a Koa app is intercepted: the app's request
- * handler is published via __koaHandler and a server is returned that is already
- * "listening" (so upstream's success path runs) but accepts no connections. The
- * front server then feeds requests straight into that handler.
+ * Instead the first listen() on a Koa app is intercepted: the app's request
+ * handler is published via __koaHandler, and a stand-in server is returned that
+ * is already "listening" without binding a socket. The front server then feeds
+ * requests straight into that handler.
+ *
+ * The stand-in must call the caller's callback, because upstream does its
+ * bookkeeping there (proxyStatusManager.start(), setPort(), a log entry). Skip
+ * it and the UI would report the proxy as stopped while it is in fact serving.
  *
  * This is preferable to reaching into the ProxyServer instance: `proxyServer` is
  * a module-private variable inside upstream's ipc/handlers.ts and is not
@@ -127,6 +132,7 @@ const safeStorage = {
  * outside and needs no upstream changes.
  * ------------------------------------------------------------------ */
 let koaHandler = null
+let koaListening = false
 
 function installKoaCapture() {
   let Koa
@@ -144,22 +150,35 @@ function installKoaCapture() {
   proto.listen = function capturedListen(...args) {
     // Only capture the first Koa app to listen: that is upstream's proxy. Any
     // later listen() falls through to real listening.
-    if (!koaHandler) {
-      try {
-        koaHandler = this.callback()
-        console.log('[shim] captured the Koa request handler (single port)')
-        // Report success to the caller without binding a socket.
-        const fake = new EventEmitter()
-        fake.listening = true
-        fake.close = (cb) => { if (typeof cb === 'function') cb(); return fake }
-        fake.address = () => ({ address: '127.0.0.1', family: 'IPv4', port: 0 })
-        setTimeout(() => fake.emit('listening'), 0)
-        return fake
-      } catch (err) {
-        console.warn('[shim] could not capture the Koa handler, listening normally:', err.message)
+    if (koaHandler) return originalListen.apply(this, args)
+
+    // Node's http.Server.listen accepts the callback last, in any position.
+    const callback = args.find((a) => typeof a === 'function')
+
+    try {
+      koaHandler = this.callback()
+      koaListening = true
+      console.log('[shim] captured the Koa request handler (single port)')
+
+      const stand_in = new EventEmitter()
+      stand_in.listening = true
+      stand_in.close = (cb) => {
+        koaListening = false
+        if (typeof cb === 'function') setTimeout(cb, 0)
+        return stand_in
       }
+      stand_in.address = () => ({ address: '127.0.0.1', family: 'IPv4', port: 0 })
+      stand_in.ref = () => stand_in
+      stand_in.unref = () => stand_in
+
+      // Upstream's own bookkeeping lives in this callback.
+      if (callback) setTimeout(() => callback(), 0)
+
+      return stand_in
+    } catch (err) {
+      console.warn('[shim] could not capture the Koa handler, listening normally:', err.message)
+      return originalListen.apply(this, args)
     }
-    return originalListen.apply(this, args)
   }
   proto.__c2aCaptured = true
 }
@@ -508,4 +527,5 @@ module.exports = {
   // listen(). The front server polls this; when null it falls back to a
   // loopback port.
   __koaHandler: () => koaHandler,
+  __koaListening: () => koaListening,
 }

@@ -1,2 +1,2 @@
-Temporary - triggers a build with failure reporting in the job summary.
-Deleted with the branch.
+Temporary - triggers a build to confirm the http.Server capture works in a
+clean image. Deleted with the branch.

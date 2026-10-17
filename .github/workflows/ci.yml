@@ -21,7 +21,10 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: chat2api
+  # Must match docker-compose.yml's image reference. The build tags the image
+  # with this same reference so the compose step uses the freshly built image
+  # instead of pulling whatever is already published.
+  IMAGE_REF: ghcr.io/${{ github.repository }}:latest
   CHAT2API_REF: main
 
 jobs:
@@ -64,7 +67,7 @@ jobs:
           context: .
           file: Dockerfile
           load: true
-          tags: ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.IMAGE_REF }}
           build-args: |
             CHAT2API_REF=${{ env.CHAT2API_REF }}
           cache-from: type=gha
@@ -72,8 +75,8 @@ jobs:
 
       - name: Show image size and upstream version
         run: |
-          docker image inspect ${{ env.IMAGE_NAME }}:latest --format 'image size: {{.Size}} bytes'
-          docker run --rm --entrypoint cat ${{ env.IMAGE_NAME }}:latest /app/UPSTREAM_INFO
+          docker image inspect ${{ env.IMAGE_REF }} --format 'image size: {{.Size}} bytes'
+          docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO
 
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
@@ -98,6 +101,10 @@ jobs:
           echo '--- web console ---'
           curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8081/
 
+          # Confirm compose used the image we just built, not a pulled one.
+          echo '--- image used by the container ---'
+          docker inspect chat2api --format '{{.Config.Image}} / {{.Image}}'
+
       - name: Tear down compose stack
         if: always()
         run: |
@@ -108,7 +115,7 @@ jobs:
       # persistence across restarts, console proxy whitelist, image size budget.
       - name: Run container smoke tests
         run: |
-          IMAGE=${{ env.IMAGE_NAME }}:latest bash tests/smoke.sh
+          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh
 
       - name: Container logs on failure
         if: failure()

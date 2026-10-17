@@ -1,24 +1,29 @@
 #!/bin/sh
 # Chat2API 网关 —— 运维脚本
 #
+# 镜像由 GitHub Actions 构建并推送到 ghcr.io/liangnianzhi/chat2api:latest，
+# 正常情况下只需 pull，不必本地构建。本地源码构建仍可用（build / build-offline）。
+#
 # 兼容群晖 DSM 7（docker 在 /usr/local/bin 且需要 root），也适用于普通 Linux。
 #
 # 用法:
-#   ./manage.sh up            启动（用已有镜像；没有才构建）
-#   ./manage.sh build         完整构建（可复现，但慢）
-#   ./manage.sh build-offline 离线组装（快，复用已编译的运行目录）
+#   ./manage.sh up            启动（缺失时自动拉取镜像）
+#   ./manage.sh pull          拉取最新镜像
+#   ./manage.sh update        拉取最新镜像并重启
 #   ./manage.sh down          停止
 #   ./manage.sh restart       重启
 #   ./manage.sh logs          跟踪日志
 #   ./manage.sh status        容器 + 健康状态
 #   ./manage.sh test          冒烟测试 API 与管理台
-#   ./manage.sh update        拉取上游最新代码并重建
 #   ./manage.sh version       当前运行的上游版本
 #   ./manage.sh keygen        生成管理密钥
 #   ./manage.sh fixdata       修复数据卷属主
 #   ./manage.sh backup        备份数据卷
 #   ./manage.sh shell         进入容器
 #   ./manage.sh doctor        诊断
+#
+#   ./manage.sh build         本地从上游源码完整构建（可复现，较慢）
+#   ./manage.sh build-offline 本地离线组装（快，需自备 .build/app-runtime.tgz）
 
 set -eu
 
@@ -42,7 +47,9 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SCRIPT_DIR"
 
 CONTAINER="chat2api"
-IMAGE="chat2api-gateway:latest"
+# 与 docker-compose.yml 中的 image 保持一致，这样本地构建的结果
+# 会被 compose 直接使用，不需要再拉取。
+IMAGE="ghcr.io/liangnianzhi/chat2api:latest"
 
 if dk compose version >/dev/null 2>&1; then
   COMPOSE="dk compose"
@@ -83,38 +90,33 @@ image_exists() {
 }
 
 case "${1:-}" in
-  build)
-    REF=$(grep -E '^CHAT2API_REF=' .env 2>/dev/null | cut -d= -f2- || true)
-    echo ">> 完整构建（从上游源码编译，上游 ${REF:-main}）"
-    compose build
-    ;;
-
-  build-offline)
-    if [ ! -f .build/app-runtime.tgz ]; then
-      echo "ERROR: 缺少 .build/app-runtime.tgz" >&2
-      echo "请先执行一次完整构建 ./manage.sh build，再按 .offline.Dockerfile 头部说明导出。" >&2
-      exit 1
-    fi
-    echo ">> 离线组装（复用 .build/app-runtime.tgz，约 $(du -h .build/app-runtime.tgz | cut -f1)）"
-    dk build -f .offline.Dockerfile -t "$IMAGE" .
-    dk images "$IMAGE" --format '>> 完成: {{.Repository}}:{{.Tag}}  {{.Size}}'
+  pull)
+    echo ">> 拉取 ${IMAGE}"
+    dk pull "$IMAGE"
     ;;
 
   up)
     prepare_data
     if image_exists; then
-      echo ">> 使用已有镜像启动"
-      compose up -d
+      echo ">> 使用本地已有镜像启动"
     else
-      echo ">> 未找到镜像，先构建"
-      compose up -d --build
+      echo ">> 本地无镜像，compose 会自动拉取"
     fi
+    compose up -d
     echo ">> 已启动，等待健康检查..."
     sleep 8
     "$0" status
     "$0" test || true
     echo
     echo ">> 管理台: http://<主机IP>:${UI_PORT}"
+    ;;
+
+  update)
+    echo ">> 拉取最新镜像并重启"
+    dk pull "$IMAGE"
+    prepare_data
+    compose up -d
+    "$0" version
     ;;
 
   down)    compose down ;;
@@ -125,6 +127,9 @@ case "${1:-}" in
     echo "--- 容器 ------------------------------------------------------"
     dk ps -a --filter "name=^${CONTAINER}$" \
       --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || true
+    echo
+    echo "--- 镜像 ------------------------------------------------------"
+    dk images "$IMAGE" --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' || true
     echo
     echo "--- 健康检查 --------------------------------------------------"
     curl -fsS "http://127.0.0.1:${API_PORT}/health" 2>/dev/null && echo || echo "  (无响应)"
@@ -148,14 +153,6 @@ case "${1:-}" in
     code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${UI_PORT}/" 2>/dev/null || echo 000)
     if [ "$code" = "200" ]; then echo "  HTTP 200 — 打开 http://<主机IP>:${UI_PORT}"
     else echo "  HTTP $code （管理台未就绪？）"; fi
-    ;;
-
-  update)
-    echo ">> 拉取上游最新代码并完整重建..."
-    compose build
-    prepare_data
-    compose up -d
-    "$0" version
     ;;
 
   version)
@@ -200,8 +197,27 @@ case "${1:-}" in
     echo "    （属主应为 1000:1000，否则执行 ./manage.sh fixdata）"
     ;;
 
+  # ---- 以下为可选的本地构建（正常不需要） ---------------------------------
+  build)
+    echo ">> 本地完整构建（从上游源码编译），产物标记为 ${IMAGE}"
+    echo ">> 这台机器上可能很慢；CI 上约 3-5 分钟"
+    dk build -t "$IMAGE" .
+    dk images "$IMAGE" --format '>> 完成: {{.Repository}}:{{.Tag}}  {{.Size}}'
+    ;;
+
+  build-offline)
+    if [ ! -f .build/app-runtime.tgz ]; then
+      echo "ERROR: 缺少 .build/app-runtime.tgz" >&2
+      echo "请先按 .offline.Dockerfile 头部说明导出一份。" >&2
+      exit 1
+    fi
+    echo ">> 离线组装（复用 .build/app-runtime.tgz）"
+    dk build -f .offline.Dockerfile -t "$IMAGE" .
+    dk images "$IMAGE" --format '>> 完成: {{.Repository}}:{{.Tag}}  {{.Size}}'
+    ;;
+
   *)
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

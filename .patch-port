@@ -1,0 +1,6 @@
+PORTS="$(docker port "$CONTAINER" 2>/dev/null | awk '{print $3}' | sort -u | tr '\n' ' ')"
+if [ "$(echo "$PORTS" | wc -w)" = "1" ] && [[ "$PORTS" == *":${PORT}"* ]]; then
+  pass "宿主机只有 1 个发布端口（$PORTS）"
+else
+  fail "发布端口异常: $PORTS"
+fi

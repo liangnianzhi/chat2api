@@ -1,21 +1,17 @@
 name: build
 
-# Container testing happens here rather than on a NAS or dev box.
+# 构建时机：**手动触发**。
 #
-# The weekly run rebuilds from upstream main on purpose: this deployment depends
-# on upstream internals that can move (store.ts's Electron imports, the vite
-# config's rollupOptions.input shape, the bootstrap in ipc/handlers.ts, the
-# preload output format). A scheduled build turns silent drift into a failing
-# run instead of a surprise.
+#   GitHub → Actions → build → Run workflow
+#
+# 一轮修改全部提交完之后点一次即可：它会把「构建 → 测试 → 推送 latest」
+# 一次做完，不会因为中间提交而重复构建。
+#
+# 例外：PR 会构建并测试（不推送），这样改动可以在合并前验完。
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: '17 3 * * 1'
+  pull_request:
 
 permissions:
   contents: read
@@ -37,12 +33,6 @@ jobs:
           sh -n shim/entrypoint.sh
           echo 'shell syntax OK'
 
-      - name: ShellCheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
-
       - name: Node syntax check
         run: |
           node --check webui/server.js
@@ -50,6 +40,12 @@ jobs:
           node --check shim/electron-shim.js
           node --check shim/gateway.js
           echo 'node syntax OK'
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
 
   build-test-publish:
     runs-on: ubuntu-latest
@@ -60,6 +56,8 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 只构建**一次**。后面部署验证、冒烟测试、推送全部用这同一个镜像，
+      # 所以一次运行只会产生一个 digest。
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -72,16 +70,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Show image size and upstream version
+      - name: Show image size, upstream version and digest
         run: |
           docker image inspect ${{ env.IMAGE_REF }} --format 'image size: {{.Size}} bytes'
+          echo "digest: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}' 2>/dev/null || echo 'local image, digest assigned on push')"
           docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO
 
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
 
-      # Exercise the documented deployment path exactly as documented: only
-      # mkdir + compose up. No .env, no manual chown.
+      # 按文档里的真实路径部署：只有 mkdir + compose up。
       - name: Bring the stack up via compose
         run: |
           mkdir -p data
@@ -122,32 +120,36 @@ jobs:
             docker logs --tail 100 "$c" 2>&1 || true
           done
 
+      # ---------------------------------------------------------------------
+      # 发布：推送的正是上面测过的那个镜像（不再重建一次）
+      # ---------------------------------------------------------------------
       - name: Log in to GHCR
-        if: success() && github.event_name != 'pull_request'
+        if: success() && github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image metadata
-        if: success() && github.event_name != 'pull_request'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
+      - name: Push the tested image
+        if: success() && github.event_name == 'workflow_dispatch'
+        run: |
+          docker push ${{ env.IMAGE_REF }}
+          echo "--- pushed ---"
+          docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}'
 
-      - name: Push image
-        if: success() && github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            CHAT2API_REF=${{ env.CHAT2API_REF }}
-          cache-from: type=gha
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo '### chat2api'
+            echo
+            echo "- image: \`${{ env.IMAGE_REF }}\`"
+            echo "- upstream: $(docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tr '\n' ' ')"
+            echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf "%.0f MB", $1/1048576}')"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "- pushed: yes (one digest for one build)"
+            else
+              echo '- pushed: no (pull request - build only)'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

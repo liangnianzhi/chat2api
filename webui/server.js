@@ -16,21 +16,21 @@
  * NO SECOND PORT
  * --------------
  * Upstream's ProxyServer wants its own listen port. Rather than run a second
- * server on loopback and forward to it, this module calls the Koa app's
- * `callback()` directly - a supported integration that produces a plain
- * (req, res) handler. So the container really does have one server on one port.
+ * server on loopback and forward to it, the shim intercepts that listen() call
+ * and publishes the Koa app's callback() as __koaHandler. This module feeds
+ * requests straight into that handler, so the container really does have one
+ * server on one port, with no extra HTTP hop.
  *
- * The loopback path is kept as a fallback: if the callback cannot be obtained
- * (upstream renames things, or the instance is not published), requests are
- * proxied to the gateway's own port instead, so the API degrades rather than
- * breaking.
+ * The loopback path is kept as a fallback: if the handler cannot be obtained
+ * (upstream restructures, or the capture did not happen), requests are proxied
+ * to the gateway's own port instead, so the API degrades rather than breaking.
  *
  * MANAGEMENT AUTH
  * ---------------
- * Upstream's management middleware expects a secret. Requests now reach the Koa
- * app without that middleware having attached anything, so this server sets the
- * Authorization header for management paths before handing off. Direct API
- * clients are unaffected: /v1 passes through untouched.
+ * Upstream's management middleware expects a secret. Requests are handed to the
+ * Koa app directly here, so this server sets the Authorization header for
+ * management paths before the hand-off. Direct API clients are unaffected:
+ * /v1 passes through untouched.
  */
 
 'use strict'
@@ -48,7 +48,7 @@ const BRIDGE_FILE = process.env.CHAT2API_BRIDGE_FILE || path.join(__dirname, 'pr
 // The only published port.
 const PUBLIC_PORT = parseInt(process.env.CHAT2API_PORT || '8082', 10)
 const PUBLIC_HOST = process.env.CHAT2API_HOST || '0.0.0.0'
-// Fallback only: used if the in-process Koa callback is unavailable.
+// Fallback only: used if the in-process Koa handler is unavailable.
 const GATEWAY = {
   host: process.env.CHAT2API_INTERNAL_HOST || '127.0.0.1',
   port: parseInt(process.env.CHAT2API_INTERNAL_PORT || '18090', 10),
@@ -78,27 +78,19 @@ function bridgeReady() {
 }
 
 /**
- * The upstream Koa request handler, resolved lazily.
+ * The captured upstream Koa request handler, or null before the proxy starts.
  *
- * Set by shim/headless-entry.ts once the ProxyServer is constructed. Resolving
- * lazily matters because the front server starts before the proxy finishes
- * binding, and early requests should still get a sensible answer.
+ * Resolved per request rather than cached here: the shim owns the captured
+ * handler and may publish it after this server has begun listening.
  */
 function proxyHandler() {
-  const server = shim && shim.__proxyServer
-  if (!server) return null
+  if (!shim || typeof shim.__koaHandler !== 'function') return null
   try {
-    const app = server.app
-    if (app && typeof app.callback === 'function') {
-      // Cache per instance: callback() builds a fresh handler each call.
-      if (server.__frontCallback) return server.__frontCallback
-      server.__frontCallback = app.callback()
-      return server.__frontCallback
-    }
+    return shim.__koaHandler() || null
   } catch (err) {
-    console.warn('[front] could not obtain the Koa callback:', err.message)
+    console.warn('[front] could not read the Koa handler:', err.message)
+    return null
   }
-  return null
 }
 
 const streamClients = new Set()
@@ -331,18 +323,18 @@ function isManagementPath(urlPath) {
 
 /** Attach the management credential and rewrite the alias, in place. */
 function prepareForGateway(req, urlPath) {
-  if (isManagementPath(urlPath)) {
-    const secret = readSecret()
-    if (secret) {
-      req.headers.authorization = `Bearer ${secret}`
-    } else {
-      console.warn('[front] management secret unavailable at', SECRET_FILE)
-    }
+  if (!isManagementPath(urlPath)) return
+
+  const secret = readSecret()
+  if (secret) {
+    req.headers.authorization = `Bearer ${secret}`
+  } else {
+    console.warn('[front] management secret unavailable at', SECRET_FILE)
   }
 
   // /management/x -> /v0/management/x. Upstream matches the full prefix in
   // several middlewares, so the rewrite happens here rather than at the source.
-  if (isManagementPath(urlPath) && !urlPath.startsWith(UPSTREAM_MGMT)) {
+  if (!urlPath.startsWith(UPSTREAM_MGMT)) {
     req.url = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
   }
 }
@@ -379,9 +371,9 @@ function proxyToGateway(req, res) {
 /**
  * Hand the request to upstream's Koa app in-process.
  *
- * Falls back to the loopback proxy when the callback is not available, which
- * covers the window before the proxy starts and any surprise about the
- * instance shape. Either way the response is upstream's own.
+ * Falls back to the loopback proxy when the handler is not available, which
+ * covers the moment before the proxy starts and any surprise about its shape.
+ * Either way the response is upstream's own.
  */
 function dispatch(req, res, urlPath) {
   prepareForGateway(req, urlPath)
@@ -437,6 +429,11 @@ function start() {
       console.log(`[front] UI: upstream renderer, IPC bridge active (${handlerCount()} channels)`)
     } else {
       console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
+    }
+    if (!proxyHandler()) {
+      console.log('[front] API: waiting for the proxy handler (falls back to loopback if it never arrives)')
+    } else {
+      console.log('[front] API: served in-process, no second port')
     }
   })
 

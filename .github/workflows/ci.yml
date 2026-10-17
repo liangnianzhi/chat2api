@@ -1,11 +1,14 @@
 name: build
 
+# 构建时机：手动触发（Actions → build → Run workflow）。
+# PR 仍会自动构建并测试（不推送），用于合并前验证。
+
 on:
   workflow_dispatch:
   pull_request:
 
 permissions:
-  contents: write   # 仅用于失败时提交 smoke-failure.log，绿后移除
+  contents: read
   packages: write
 
 env:
@@ -17,11 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Shell syntax check
         run: |
           bash -n tests/smoke.sh
           sh -n shim/entrypoint.sh
           echo 'shell syntax OK'
+
       - name: Node syntax check
         run: |
           node --check webui/server.js
@@ -29,6 +34,7 @@ jobs:
           node --check shim/electron-shim.js
           node --check shim/gateway.js
           echo 'node syntax OK'
+
       - name: ShellCheck
         run: |
           sudo apt-get update -qq
@@ -40,8 +46,10 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -53,12 +61,15 @@ jobs:
             CHAT2API_REF=${{ env.CHAT2API_REF }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Show image size, upstream version and digest
+
+      - name: Show image size and upstream version
         run: |
           docker image inspect ${{ env.IMAGE_REF }} --format 'image size: {{.Size}} bytes'
           docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO
+
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
+
       - name: Bring the stack up via compose
         run: |
           mkdir -p data
@@ -69,24 +80,46 @@ jobs:
           done
           echo '--- container log ---'
           docker compose logs --tail 60 || true
+
       - name: Tear down compose stack
         if: always()
-        run: |
-          docker compose down -v || true
+        run: docker compose down -v || true
+
       - name: Run container smoke tests
         id: smoke
         run: |
           set -o pipefail
           IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
+
+      # 把失败输出写进 job summary：无需认证、可直接在网页上读。
+      - name: Publish smoke output on failure
+        if: failure()
+        run: |
+          if [ ! -f /tmp/smoke.log ]; then echo 'no smoke log'; exit 0; fi
+          {
+            echo '### Smoke test output'
+            echo
+            echo '```'
+            # 去掉 ANSI 颜色，避免在 summary 里显示成乱码
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Container logs on failure
         if: failure()
         run: |
-          { echo '# Smoke test output'; echo; echo '```'; cat /tmp/smoke.log 2>/dev/null || echo none; echo '```'; } > smoke-failure.log
-          git config user.name  'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f smoke-failure.log
-          git commit -m 'ci: capture failure output [skip ci]' || { echo 'nothing'; exit 0; }
-          git push origin "HEAD:${GITHUB_REF_NAME}" || echo 'push failed'
+          {
+            echo '### Container logs'
+            echo
+            echo '```'
+            docker ps -a
+            for c in $(docker ps -aq); do
+              echo "--- $c ---"
+              docker logs --tail 120 "$c" 2>&1 || true
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Log in to GHCR
         if: success() && github.event_name == 'workflow_dispatch'
         uses: docker/login-action@v3
@@ -94,6 +127,25 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Push the tested image
         if: success() && github.event_name == 'workflow_dispatch'
-        run: docker push ${{ env.IMAGE_REF }}
+        run: |
+          docker push ${{ env.IMAGE_REF }}
+          docker image inspect ${{ env.IMAGE_REF }} --format '{{index .RepoDigests 0}}'
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo '### chat2api'
+            echo
+            echo "- image: \`${{ env.IMAGE_REF }}\`"
+            echo "- upstream: $(docker run --rm --entrypoint cat ${{ env.IMAGE_REF }} /app/UPSTREAM_INFO | tr '\n' ' ')"
+            echo "- size: $(docker image inspect ${{ env.IMAGE_REF }} --format '{{.Size}}' | awk '{printf \"%.0f MB\", $1/1048576}')"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo '- pushed: yes'
+            else
+              echo '- pushed: no (pull request)'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -22,6 +22,37 @@ const DATA_DIR = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/da
 const SECRET_FILE = path.join(DATA_DIR, '.safe-storage-key')
 
 /* ------------------------------------------------------------------ *
+ * process.resourcesPath
+ *
+ * Electron defines this; plain Node does not. The compiled bundle uses it to
+ * locate the sha3 wasm it needs for DeepSeek/GLM request signing:
+ *
+ *   const wasmPath = app.isPackaged
+ *     ? path.join(process.resourcesPath, "sha3_wasm_bg.7b9ca65ddd.wasm")
+ *     : path.join(app.getAppPath(), "sha3_wasm_bg.7b9ca65ddd.wasm")
+ *
+ * With app.isPackaged = true and resourcesPath undefined, that path.join throws
+ * a TypeError - so signing would fail on the first real request. Point it at the
+ * directory that actually holds the wasm (the image puts it beside the bundle).
+ * ------------------------------------------------------------------ */
+const RESOURCES_DIR = process.env.CHAT2API_RESOURCES_DIR
+  || path.join(__dirname, '..', 'upstream')
+
+if (typeof process.resourcesPath !== 'string') {
+  try {
+    Object.defineProperty(process, 'resourcesPath', {
+      value: RESOURCES_DIR,
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    })
+  } catch {
+    // If the property is locked down, fall back to plain assignment.
+    process.resourcesPath = RESOURCES_DIR
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * safeStorage
  * Electron's safeStorage encrypts via the OS keyring. In a container there
  * is no keyring, so we persist a random key on the data volume and use
@@ -103,7 +134,7 @@ const app = {
   getVersion: () => process.env.CHAT2API_VERSION || '0.0.0-container',
   getName: () => 'Chat2API',
   getPath: (name) => appPaths[name] || DATA_DIR,
-  getAppPath: () => process.cwd(),
+  getAppPath: () => RESOURCES_DIR,
   setPath: () => {},
   quit: () => { process.exit(0) },
   exit: (code) => { process.exit(code || 0) },

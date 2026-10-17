@@ -88,6 +88,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+info "上游 wasm 依赖（DeepSeek/GLM 签名）"
+# ---------------------------------------------------------------------------
+# 编译后的 bundle 通过 process.resourcesPath 定位 sha3 wasm；该属性只在 Electron
+# 中存在，纯 Node 下为 undefined，path.join 会直接抛错。此项确保 shim 已定义它
+# 且 wasm 确实在对应目录里，否则首个真实 DeepSeek 请求才会暴露问题。
+if docker exec "$CONTAINER" node -e '
+require("/app/shim/electron-shim.js");
+const fs = require("fs"), path = require("path");
+const p = process.resourcesPath;
+if (typeof p !== "string") { console.error("resourcesPath is not a string"); process.exit(1) }
+const f = path.join(p, "sha3_wasm_bg.7b9ca65ddd.wasm");
+if (!fs.existsSync(f)) { console.error("wasm missing at " + f); process.exit(1) }
+console.log("ok");
+' >/dev/null 2>&1; then
+  pass "process.resourcesPath 可用且能定位 wasm"
+else
+  fail "wasm 路径解析失败（DeepSeek/GLM 签名会报错）"
+fi
+
+# ---------------------------------------------------------------------------
 info "OpenAI 兼容 API"
 # ---------------------------------------------------------------------------
 HEALTH="$(curl -fsS "http://127.0.0.1:${API_PORT}/health" || echo '')"

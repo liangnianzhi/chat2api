@@ -45,8 +45,6 @@
   .msg.err { background:#2d1416; color:var(--err); border:1px solid #5c2226; }
   code { background:#0c0e12; padding:1px 5px; border-radius:4px; font-size:12px; }
   .hint { color:var(--muted); font-size:12px; margin-top:6px; line-height:1.6; }
-  .inline { display:flex; gap:8px; align-items:center; }
-  .inline input { flex:1; }
   dialog { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px;
            padding:20px; width:min(560px,92vw); }
   dialog::backdrop { background:rgba(0,0,0,.6); }
@@ -60,20 +58,10 @@
   <span id="statusBadge" class="badge">连接中…</span>
   <span style="flex:1"></span>
   <button id="btnRefresh">刷新</button>
-  <button id="btnLock" title="清除本机保存的管理密钥">退出</button>
 </header>
 
 <main>
-  <div class="card" id="authCard">
-    <h2>管理密钥</h2>
-    <label for="secret">管理 API 密钥（对应容器环境变量 CHAT2API_MANAGEMENT_SECRET）</label>
-    <div class="inline">
-      <input id="secret" type="password" placeholder="粘贴管理密钥" autocomplete="current-password">
-      <button class="primary" id="btnSaveSecret">保存</button>
-    </div>
-    <div class="hint">保存在本机浏览器（localStorage），不会上传到别处。</div>
-    <div id="authMsg" class="msg"></div>
-  </div>
+  <div id="banner" class="msg"></div>
 
   <div class="card">
     <h2>概览</h2>
@@ -171,7 +159,6 @@
 <script>
 'use strict';
 const $ = (id) => document.getElementById(id);
-const LS_SECRET = 'chat2api.mgmt.secret';
 
 const CRED_HINTS = {
   deepseek:   { token: '从 chat.deepseek.com 的 DevTools → Application → Local Storage 取 userToken' },
@@ -185,10 +172,11 @@ const CRED_HINTS = {
   zai:        { token: 'Z.ai token（上游提示前端风控，可能不可用）' },
 };
 
-let state = { secret:'', accounts:[], providers:[], keys:[], config:null };
+let state = { accounts:[], providers:[], keys:[], config:null };
 
+// 管理密钥由服务端注入，浏览器侧不需要携带任何凭据。
 async function api(method, path, body) {
-  const headers = { Authorization: 'Bearer ' + state.secret };
+  const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const res = await fetch(path, { method, headers,
     body: body === undefined ? undefined : JSON.stringify(body) });
@@ -213,22 +201,12 @@ function esc(s) {
 function setBadge(t, cls) {
   const b = $('statusBadge'); b.textContent = t; b.className = 'badge' + (cls ? ' ' + cls : '');
 }
-
-function loadSecret() {
-  state.secret = localStorage.getItem(LS_SECRET) || '';
-  $('secret').value = state.secret;
+function banner(text, ok) {
+  const el = $('banner');
+  if (!text) { el.className = 'msg'; return; }
+  el.textContent = text;
+  el.className = 'msg show ' + (ok ? 'ok' : 'err');
 }
-$('btnSaveSecret').onclick = () => {
-  state.secret = $('secret').value.trim();
-  localStorage.setItem(LS_SECRET, state.secret);
-  showMsg($('authMsg'), '已保存', true);
-  refreshAll();
-};
-$('btnLock').onclick = () => {
-  localStorage.removeItem(LS_SECRET); state.secret = ''; $('secret').value = '';
-  setBadge('未配置密钥', 'err');
-  showMsg($('authMsg'), '已清除本机保存的密钥', true);
-};
 
 async function loadProviders() {
   const r = await api('GET', '/v0/management/providers');
@@ -349,18 +327,15 @@ async function loadOverview() {
 }
 
 async function refreshAll() {
-  if (!state.secret) { setBadge('未配置密钥', 'err'); return; }
   try {
     await loadProviders(); await loadAccounts(); await loadKeys();
     await loadConfig();    await loadOverview();
     setBadge('已连接', 'ok');
-    $('authMsg').className = 'msg';
+    banner('');
   } catch (e) {
-    if (e.status === 401 || e.status === 403) setBadge('密钥无效', 'err');
-    else if (e.status === 404) setBadge('管理 API 未启用', 'err');
-    else setBadge('连接失败', 'err');
-    showMsg($('authMsg'), e.message +
-      (e.status === 404 ? '（请在容器中设置 CHAT2API_MANAGEMENT_SECRET）' : ''), false);
+    setBadge('连接失败', 'err');
+    banner('无法连接网关：' + e.message +
+      '（确认容器已启动，并检查 8081 端口）', false);
   }
 }
 
@@ -422,8 +397,8 @@ $('btnSaveCfg').onclick = async () => {
 
 $('btnRefresh').onclick = () => refreshAll();
 
-loadSecret();
-if (state.secret) refreshAll(); else setBadge('请先填写管理密钥', 'err');
+// 直接加载，无需登录。
+refreshAll();
 </script>
 </body>
 </html>

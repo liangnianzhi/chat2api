@@ -16,6 +16,10 @@
  * behaviour: the normal GUI entry (index.ts) is unchanged.
  */
 
+import { randomBytes } from 'crypto'
+import { chmodSync, mkdirSync, writeFileSync } from 'fs'
+import { join } from 'path'
+
 import { storeManager } from './store/store'
 import { ProxyServer } from './proxy/server'
 
@@ -36,19 +40,18 @@ function envInt(name: string, fallback: number): number {
 }
 
 const WEBUI_ENABLED = envBool('CHAT2API_ENABLE_WEBUI', true)
-const MANAGEMENT_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
+const ENV_SECRET = process.env.CHAT2API_MANAGEMENT_SECRET || ''
 
 /**
- * The web console is a thin reverse proxy in front of the management API, so it
- * is useless unless that API is enabled. Rather than make operators discover and
- * set a second flag (and hit a confusing 404 in the console), enabling the
- * console with a secret configured turns the API on automatically.
- *
- * An explicit CHAT2API_ENABLE_MANAGEMENT_API still works and is honoured.
+ * The web console drives the management API, so that API must be on whenever the
+ * console is. Requiring a second flag (and a secret) just to get a working UI is
+ * friction with no benefit: the secret is generated automatically below.
  */
 const MANAGEMENT_API_ENABLED =
-  envBool('CHAT2API_ENABLE_MANAGEMENT_API', false) ||
-  (WEBUI_ENABLED && MANAGEMENT_SECRET !== '')
+  envBool('CHAT2API_ENABLE_MANAGEMENT_API', false) || WEBUI_ENABLED
+
+const DATA_DIR = process.env.CHAT2API_HOME || join(process.env.HOME || '/data', '.chat2api')
+const SECRET_FILE = join(DATA_DIR, '.management-secret')
 
 const CONFIG = {
   port: envInt('CHAT2API_PORT', 8080),
@@ -61,20 +64,38 @@ const CONFIG = {
   corsOrigin: process.env.CHAT2API_CORS_ORIGIN || '*',
   loadBalanceStrategy: process.env.CHAT2API_LB_STRATEGY || 'round-robin',
   enableManagementApi: MANAGEMENT_API_ENABLED,
-  managementSecret: MANAGEMENT_SECRET,
+  managementSecret: ENV_SECRET,
 }
 
 console.log('[headless] Chat2API gateway starting')
 console.log('[headless] listening target:', `${CONFIG.host}:${CONFIG.port}`)
+
+/**
+ * Publish the effective management secret where the console can read it.
+ *
+ * The console is a separate process and cannot decrypt data.json, so the secret
+ * is mirrored to a 0600 file on the same volume. This is the same trust
+ * boundary as the credential-encryption key stored alongside it.
+ */
+function writeSecretFile(secret: string): void {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, secret, { mode: 0o600 })
+    chmodSync(SECRET_FILE, 0o600)
+  } catch (err) {
+    console.warn('[headless] could not write management secret file:',
+      err instanceof Error ? err.message : err)
+  }
+}
 
 /* ------------------------------------------------------------------ *
  * Seed configuration the container needs.
  *
  * Precedence: values already stored in data.json win for anything the operator
  * may have tuned through the console (load balancing, log level, ...), so their
- * choices survive a restart. The management secret is the exception: it comes
- * from the environment and the environment is authoritative, so rotating it in
- * .env takes effect on restart as an operator would expect.
+ * choices survive a restart. The management secret is the exception: the
+ * environment is authoritative when it provides one, so rotating it in the
+ * compose file takes effect on restart.
  * ------------------------------------------------------------------ */
 async function reconcileConfig(): Promise<void> {
   const current = storeManager.getConfig() as Record<string, any>
@@ -113,28 +134,30 @@ async function reconcileConfig(): Promise<void> {
 
   if (CONFIG.enableManagementApi) {
     const currentMgmt = current.managementApi || {}
-    const nextSecret = CONFIG.managementSecret || currentMgmt.managementApiSecret || ''
+    // env > stored > freshly generated. Generated once, then persisted in
+    // data.json so restarts keep the same value and open consoles keep working.
+    let effectiveSecret: string = ENV_SECRET || currentMgmt.managementApiSecret || ''
+    if (!effectiveSecret) {
+      effectiveSecret = randomBytes(32).toString('hex')
+      console.log('[headless] generated a management secret for the console')
+    }
+
     if (
       currentMgmt.enableManagementApi !== true ||
-      currentMgmt.managementApiSecret !== nextSecret
+      currentMgmt.managementApiSecret !== effectiveSecret
     ) {
       updates.managementApi = {
         ...currentMgmt,
         enableManagementApi: true,
-        managementApiSecret: nextSecret,
+        managementApiSecret: effectiveSecret,
       }
-      if (
-        CONFIG.managementSecret &&
-        currentMgmt.managementApiSecret &&
-        currentMgmt.managementApiSecret !== CONFIG.managementSecret
-      ) {
+      if (ENV_SECRET && currentMgmt.managementApiSecret &&
+          currentMgmt.managementApiSecret !== ENV_SECRET) {
         console.log('[headless] management secret updated from environment')
       }
     }
-    if (!nextSecret) {
-      console.warn('[headless] WARNING: management API is enabled but no secret is set. '
-        + 'Set CHAT2API_MANAGEMENT_SECRET, otherwise the web console cannot log in.')
-    }
+
+    writeSecretFile(effectiveSecret)
   }
 
   // A headless process must never try to minimise into a tray that cannot exist.
@@ -174,11 +197,7 @@ async function main(): Promise<void> {
   console.log(`[headless] ready - providers: ${providers.length}, accounts: ${accounts.length}`)
   if (accounts.length === 0) {
     console.log('[headless] no accounts configured yet.')
-    if (CONFIG.enableManagementApi) {
-      console.log('[headless] add accounts via the web console, or the management API at /v0/management')
-    } else {
-      console.log('[headless] tip: set CHAT2API_MANAGEMENT_SECRET to enable the web console')
-    }
+    console.log('[headless] open the web console to add them')
   }
 
   /* Graceful shutdown: flush upstream's buffered log writers so the data

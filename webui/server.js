@@ -8,13 +8,16 @@
  * (/v0/management/*) as the only way to add providers and accounts - usable
  * from curl, but there is no page to open in a browser.
  *
- * This server fills that gap. It is deliberately tiny and dependency-free:
- *   * GET /            -> serves webui/index.html
- *   * /v0/management/* -> reverse-proxied to the gateway on localhost
+ * THIS CONSOLE IS OPEN, ITS CREDENTAL IS NOT
+ * ------------------------------------------
+ * The management API requires a secret. The console is its only intended client,
+ * so the gateway writes that secret to /data/.chat2api/.management-secret and
+ * this proxy attaches it server-side. Opening the page therefore "just works",
+ * with no login step.
  *
- * Proxying rather than calling the gateway directly from the browser keeps
- * everything same-origin, so no CORS configuration is needed and the
- * management secret never has to be exposed to a cross-origin request.
+ * Callers hitting the gateway directly on :8080 still need the secret - only the
+ * loopback console auto-authenticates. Keeping the API protected while the UI is
+ * open is deliberate: bind :8081 to your LAN, bind :8080 where the clients are.
  */
 
 'use strict'
@@ -30,6 +33,8 @@ const GATEWAY = {
   port: parseInt(process.env.CHAT2API_PORT || '8080', 10),
 }
 const UI_FILE = process.env.CHAT2API_UI_FILE || path.join(__dirname, 'index.html')
+const SECRET_FILE = process.env.CHAT2API_SECRET_FILE
+  || path.join(process.env.CHAT2API_HOME || '/data/.chat2api', '.management-secret')
 
 // Paths this console is allowed to proxy. Anything else is refused, so the
 // console cannot become an open relay to the rest of the gateway.
@@ -42,13 +47,45 @@ function isAllowed(p) {
   return ALLOWED_PREFIXES.some((prefix) => p === prefix || p.startsWith(prefix))
 }
 
+function isManagementPath(p) {
+  return p.startsWith('/v0/management/')
+}
+
+// Read per request: the file is tiny, and this stays correct if the secret is
+// re-generated or rotated in the compose file between restarts.
+function readSecret() {
+  if (process.env.CHAT2API_MANAGEMENT_SECRET) {
+    return process.env.CHAT2API_MANAGEMENT_SECRET
+  }
+  try {
+    return fs.readFileSync(SECRET_FILE, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
 function proxy(req, res) {
+  const urlPath = (req.url || '/').split('?')[0]
+
+  const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
+
+  if (isManagementPath(urlPath)) {
+    const secret = readSecret()
+    if (secret) {
+      // Attach unconditionally: the console is the trusted client, and letting a
+      // stale header from the browser win would only cause confusing 401s.
+      headers.authorization = `Bearer ${secret}`
+    } else {
+      console.warn('[webui] management secret unavailable at', SECRET_FILE)
+    }
+  }
+
   const options = {
     host: GATEWAY.host,
     port: GATEWAY.port,
     method: req.method,
     path: req.url,
-    headers: { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` },
+    headers,
   }
 
   const upstream = http.request(options, (upRes) => {

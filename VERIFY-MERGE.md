@@ -1,2 +1,2 @@
-Temporary - triggers the pull_request build with failure capture enabled.
+Temporary - triggers a build with failure reporting in the job summary.
 Deleted with the branch.

@@ -10,6 +10,9 @@
  *
  * This module provides those APIs for a plain Node process, plus the plumbing
  * that lets the real renderer drive the real main-process logic from a browser.
+ *
+ * It also captures upstream's Koa request handler so the front server can serve
+ * the API without a second listening port. See "single port capture" below.
  */
 
 'use strict'
@@ -108,6 +111,62 @@ const safeStorage = {
 }
 
 /* ------------------------------------------------------------------ *
+ * Single port capture
+ *
+ * Upstream's ProxyServer owns a Koa app and calls `app.listen(port, host)` to
+ * serve it. That would give the container a second listening port.
+ *
+ * Instead, the first `listen()` on a Koa app is intercepted: the app's request
+ * handler is published via __koaHandler and a server is returned that is already
+ * "listening" (so upstream's success path runs) but accepts no connections. The
+ * front server then feeds requests straight into that handler.
+ *
+ * This is preferable to reaching into the ProxyServer instance: `proxyServer` is
+ * a module-private variable inside upstream's ipc/handlers.ts and is not
+ * exported, so there is nothing to import. Intercepting listen() works from the
+ * outside and needs no upstream changes.
+ * ------------------------------------------------------------------ */
+let koaHandler = null
+
+function installKoaCapture() {
+  let Koa
+  try {
+    Koa = require('koa')
+  } catch (err) {
+    console.warn('[shim] koa not found; falling back to a loopback port:', err.message)
+    return
+  }
+
+  const proto = Koa.prototype
+  if (proto.__c2aCaptured) return
+  const originalListen = proto.listen
+
+  proto.listen = function capturedListen(...args) {
+    // Only capture the first Koa app to listen: that is upstream's proxy. Any
+    // later listen() falls through to real listening.
+    if (!koaHandler) {
+      try {
+        koaHandler = this.callback()
+        console.log('[shim] captured the Koa request handler (single port)')
+        // Report success to the caller without binding a socket.
+        const fake = new EventEmitter()
+        fake.listening = true
+        fake.close = (cb) => { if (typeof cb === 'function') cb(); return fake }
+        fake.address = () => ({ address: '127.0.0.1', family: 'IPv4', port: 0 })
+        setTimeout(() => fake.emit('listening'), 0)
+        return fake
+      } catch (err) {
+        console.warn('[shim] could not capture the Koa handler, listening normally:', err.message)
+      }
+    }
+    return originalListen.apply(this, args)
+  }
+  proto.__c2aCaptured = true
+}
+
+installKoaCapture()
+
+/* ------------------------------------------------------------------ *
  * app
  * ------------------------------------------------------------------ */
 const appPaths = {
@@ -153,8 +212,7 @@ const app = {
  *
  * Upstream registers every renderer-facing capability as
  * `ipcMain.handle(channel, fn)`. Recording those handlers is what lets the real
- * renderer run in a browser: the front server dispatches HTTP calls into this
- * map, so every UI action lands on upstream's own implementation.
+ * renderer run in a browser.
  * ------------------------------------------------------------------ */
 const eventBus = new EventEmitter()
 eventBus.setMaxListeners(0)
@@ -164,8 +222,7 @@ eventBus.setMaxListeners(0)
  *
  * shell.openExternal is how upstream opens a login page, and OAuth adapters call
  * it directly without anyone having registered a listener first - so a plain
- * broadcast reached nobody and the browser never opened. These are replayed when
- * the first subscriber appears.
+ * broadcast reached nobody and the browser never opened.
  */
 const pendingOpens = []
 let hasSubscribers = false
@@ -366,7 +423,6 @@ const net = {
  * ------------------------------------------------------------------ */
 const shell = {
   openExternal: async (url) => {
-    // No desktop to open onto: hand it to the UI, which opens a real tab.
     console.log('[shim] shell.openExternal -> browser tab:', url)
     emitEvent('__c2a:openExternal', [String(url)])
     return undefined
@@ -448,4 +504,8 @@ module.exports = {
   __eventBus: eventBus,
   __windowStub: windowStub,
   __replayPendingOpens: replayPendingOpens,
+  // The captured upstream Koa handler, or null until the proxy app calls
+  // listen(). The front server polls this; when null it falls back to a
+  // loopback port.
+  __koaHandler: () => koaHandler,
 }

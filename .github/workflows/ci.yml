@@ -1,11 +1,7 @@
 name: build
 
-# 构建时机：push 到 main 时自动构建、测试并推送 latest。
-#
-# 一轮改动通常跨多个提交，每次 push 都会构建；如果想把多个改动合成一次构建，
-# 可以把它们合成一次提交再 push。
-#
-# PR 也会构建并测试（不推送），用于合并前验证。
+# push 到 main 时自动构建、测试并推送 latest。
+# PR 也会构建并测试（不推送）；workflow_dispatch 可手动重建。
 
 on:
   push:
@@ -31,6 +27,7 @@ jobs:
       - name: Shell syntax check
         run: |
           bash -n tests/smoke.sh
+          sh -n deploy.sh
           sh -n shim/entrypoint.sh
           echo 'shell syntax OK'
 
@@ -46,7 +43,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=error tests/smoke.sh shim/entrypoint.sh
+          shellcheck --severity=error tests/smoke.sh deploy.sh shim/entrypoint.sh
 
   build-test-publish:
     runs-on: ubuntu-latest
@@ -92,13 +89,26 @@ jobs:
         if: always()
         run: docker compose down -v || true
 
+      # 完整套件：自建临时容器，覆盖容器内部状态（端口、降权、时区、加密、重启）。
       - name: Run container smoke tests
         id: smoke
         run: |
           set -o pipefail
           IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
 
-      # 失败输出写进 job summary：无需认证，直接在运行页面上可读。
+      # 再用「外部客户端」视角验证一遍同一个镜像：只有 HTTP，不碰 docker。
+      # 这能抓到仅在真实部署路径下出现的问题（例如代理自报 stopped）。
+      - name: Verify over HTTP like a real client
+        if: success()
+        run: |
+          docker run -d --name c2a-http -p 127.0.0.1:18083:8082 ${{ env.IMAGE_REF }} >/dev/null
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:18083/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh
+          docker rm -f c2a-http >/dev/null 2>&1 || true
+
       - name: Publish smoke output on failure
         if: failure()
         run: |
@@ -155,4 +165,6 @@ jobs:
             else
               echo '- pushed: yes'
             fi
+            echo
+            echo 'Deploy on the NAS with: `./deploy.sh`'
           } >> "$GITHUB_STEP_SUMMARY"

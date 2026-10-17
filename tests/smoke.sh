@@ -2,9 +2,6 @@
 #
 # Smoke test for the chat2api container.
 #
-# Runs against a freshly created container and reports PASS/FAIL per check.
-# Used by .github/workflows/ci.yml, and runnable locally:
-#
 #   IMAGE=ghcr.nju.edu.cn/liangnianzhi/chat2api:latest ./tests/smoke.sh
 #
 # Two modes:
@@ -95,7 +92,6 @@ PROXY_STATE="$(grep -oE '"status":"[a-z]+"' <<<"$HEALTH_JSON" | head -1 | cut -d
   && pass "上游代理状态为 running" \
   || fail "上游代理状态为 '${PROXY_STATE:-无}'（应为 running）: $HEALTH_JSON"
 
-# 界面 Header 与状态事件都从 proxyStatusManager 取值；内部绑定端口不能暴露给用户。
 STATUS_JSON="$(curl -sS -X POST "${BASE}/__ipc" -H 'Content-Type: application/json' \
   -d '{"channel":"proxy:getStatus","args":[]}' 2>/dev/null || echo '')"
 ADVERTISED_PORT="$(grep -oE '"port":[0-9]+' <<<"$STATUS_JSON" | head -1 | grep -oE '[0-9]+')"
@@ -147,7 +143,43 @@ else
   fail "页面未引用任何 /assets/ 资源"
 fi
 
+info "登录页（网页登录的替代路径）"
+LOGIN_HTML="$(curl -fsS "${BASE}/__login?provider=deepseek&providerId=deepseek" || echo '')"
+grep -q 'userToken' <<<"$LOGIN_HTML" \
+  && pass "/__login 返回带提供商指引的页面" \
+  || fail "/__login 内容异常（缺少该提供商的注取指引）"
+
+# 未授权调用不得直接写入账号：缺参数应拒。
+BAD_FINISH="$(curl -s -X POST "${BASE}/__login/finish" -H 'Content-Type: application/json' \
+  -d '{}' 2>/dev/null || echo '')"
+grep -q '"ok":false' <<<"$BAD_FINISH" \
+  && pass "缺参数提交被拒绝" || fail "缺参数提交未被拒绝: $BAD_FINISH"
+
+# 无效凭证必须被上游验证抦下，而不是先存下再说。
+INVALID_FINISH="$(curl -s -X POST "${BASE}/__login/finish" -H 'Content-Type: application/json' \
+  -d '{"providerId":"deepseek","providerType":"deepseek","credentials":{"token":"obviously-invalid-token"}}' \
+  2>/dev/null || echo '')"
+if grep -q '"ok":false' <<<"$INVALID_FINISH"; then
+  pass "无效凭证被验证拒绝（未写入账号）"
+else
+  fail "无效凭证未被拒绝: $INVALID_FINISH"
+fi
+
 if [ -z "$VERIFY_URL" ]; then
+  info "网页登录不再报错，而是引导到登录页"
+  # 容器里开不了 Electron 窗口；这条必须给出一条引导，而不是报窗口错误。
+  IAL="$(curl -sS -X POST "${BASE}/__ipc" -H 'Content-Type: application/json' \
+    -d '{"channel":"oauth:startInAppLogin","args":[{"providerId":"deepseek","providerType":"deepseek"}]}' \
+    2>/dev/null || echo '')"
+  if grep -q '登录页\|\/__login' <<<"$IAL"; then
+    pass "startInAppLogin 返回引导（指向登录页）"
+  else
+    fail "startInAppLogin 未返回引导: $IAL"
+  fi
+  grep -qi 'BrowserWindow\|ENOTSUP' <<<"$IAL" \
+    && fail "startInAppLogin 仍在报 GUI 不可用错误" \
+    || pass "startInAppLogin 不再报 GUI 错误"
+
   info "只有一个对外端口，且 API 在进程内处理"
   LOGS="$(docker logs "$CONTAINER" 2>&1 || true)"
   grep -q 'electron shim active' <<<"$LOGS" \
@@ -219,7 +251,7 @@ console.log("ok");
     -d '{"channel":"accounts:getAll","args":[false]}' || echo '')"
   grep -q '"ok":true' <<<"$IPC_ACC" && pass "IPC 桥能派发真实 channel" || fail "IPC 桥派发失败: $IPC_ACC"
 
-  info "浏览器打开（OAuth 登录依赖）"
+  info "浏览器打开"
   SSE_FILE="$WORKDIR/sse.txt"
   : > "$SSE_FILE"
   ( curl -sS --max-time 15 -N "${BASE}/__ipc/events" > "$SSE_FILE" 2>/dev/null & )
@@ -228,7 +260,7 @@ console.log("ok");
     -d '{"channel":"app:openExternal","args":["https://chat.deepseek.com"]}' >/dev/null 2>&1 || true
   sleep 3
   if grep -q 'chat.deepseek.com' "$SSE_FILE" 2>/dev/null; then
-    pass "openExternal 事件会送达界面（可打开登录页）"
+    pass "openExternal 事件会送达界面"
   else
     fail "openExternal 事件未到达事件流"
   fi
@@ -290,7 +322,6 @@ catch { process.exit(0) }
   SECRET_AFTER="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
   [ "$SECRET_AFTER" = "$SECRET" ] && pass "重启后管理密钥不变" || fail "重启后管理密钥变化"
 
-  # 重启后代理必须仍在运行，且仍上报公开端口。
   RESTART_HEALTH="$(curl -fsS "${BASE}/health" 2>/dev/null || echo '')"
   RESTART_STATE="$(grep -oE '"status":"[a-z]+"' <<<"$RESTART_HEALTH" | head -1 | cut -d'"' -f4)"
   [ "$RESTART_STATE" = "running" ] \

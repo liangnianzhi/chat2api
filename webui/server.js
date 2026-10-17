@@ -119,7 +119,7 @@ const MIME = {
 const API_PREFIXES = ['/v0/', '/v1/', '/api/', ALIAS_MGMT]
 
 /* ------------------------------------------------------------------ *
- * Console page
+ * UI
  * ------------------------------------------------------------------ */
 function readSecret() {
   if (process.env.CHAT2API_MANAGEMENT_SECRET) return process.env.CHAT2API_MANAGEMENT_SECRET
@@ -391,11 +391,12 @@ function serveStatic(res, urlPath) {
  * ------------------------------------------------------------------ */
 function proxy(req, res, urlPath) {
   const headers = { ...req.headers, host: `${GATEWAY.host}:${GATEWAY.port}` }
-  const secret = readSecret()
 
   // Only the management API needs the injected credential; /v1 passes through
   // untouched so client API keys keep working as usual.
-  if (urlPath.startsWith(UPSTREAM_MGMT) || urlPath.startsWith(ALIAS_MGMT)) {
+  if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')
+      || urlPath.startsWith(UPSTREAM_MGMT)) {
+    const secret = readSecret()
     if (secret) {
       headers.authorization = `Bearer ${secret}`
     } else {
@@ -404,7 +405,7 @@ function proxy(req, res, urlPath) {
   }
 
   // /management/x -> /v0/management/x. Upstream matches the full prefix in
-  // several middlewares, so the rewrite is done here rather than at the source.
+  // several middlewares, so the rewrite happens here rather than at the source.
   let targetPath = req.url
   if (urlPath === ALIAS_MGMT || urlPath.startsWith(ALIAS_MGMT + '/')) {
     targetPath = UPSTREAM_MGMT + req.url.slice(ALIAS_MGMT.length)
@@ -479,7 +480,7 @@ function start() {
       console.log(`[front] UI: upstream renderer, IPC bridge active (${handlerCount()} channels)`)
     } else {
       console.warn('[front] UI: IPC bridge has NO registered channels - the page will not function.')
-      console.warn('[front] The API on /v1 is unaffected. Check the log above for the cause.')
+      console.warn('[front] The API on /v1 is unaffected. See the log above for the cause.')
     }
     console.log(`[front] proxying /v1, /v0, /health and ${ALIAS_MGMT} -> http://${GATEWAY.host}:${GATEWAY.port}`)
   })
@@ -489,7 +490,7 @@ function start() {
     server.close(() => process.exit(0))
     setTimeout(() => process.exit(0), 3000).unref()
   }
-  for (const sig of ['SIGTERM', 'SIGINT']) process.on('SIGINT' in process ? sig : sig, () => shutdown(sig))
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => shutdown(sig))
 
   return server
 }

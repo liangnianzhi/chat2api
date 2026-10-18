@@ -3,26 +3,25 @@
  *
  * WHAT IT SERVES
  * --------------
- * One address, one HTTP server:
- *
  *   GET /                -> the upstream renderer (the real Chat2API UI)
  *   /assets/*, static    -> files from out/renderer
  *   POST /__ipc          -> dispatch into upstream's ipcMain.handle registry
  *   GET  /__ipc/events   -> webContents.send events, streamed over SSE
  *   GET  /__preload.js   -> the browser bridge + upstream's preload bundle
- *   GET  /__login        -> guided login page (see below)
+ *   GET  /__login        -> guided add-account page
  *   POST /__login/finish -> validate + store the credential it collected
  *   /management/*        -> rewritten to /v0/management/*, then to the proxy
  *   everything else      -> upstream's HTTP handler (the API)
  *
- * THE LOGIN PAGE
- * --------------
- * Upstream's web login opens an Electron window and reads the provider's tokens
- * out of it. A container cannot do that, so "web login" would always fail.
- * Instead the shim answers that request by pointing here: this page opens the
- * provider site in the user's own browser, says which field to copy, then
- * validates what they paste before storing it. Honest about the boundary rather
- * than pretending to automate it.
+ * ADDING ACCOUNTS
+ * ---------------
+ * Upstream's web login opens an Electron window and reads tokens out of it; a
+ * container cannot. The /__login page therefore walks the user through copying
+ * the credential themselves, then this server validates and stores it.
+ *
+ * Storage itself is upstream's: every account keeps its own credentials, so N
+ * accounts for one provider coexist and are scheduled by the proxy. Whether the
+ * browser is still signed in afterwards is irrelevant.
  */
 
 'use strict'
@@ -239,12 +238,11 @@ async function handleIpc(req, res) {
 }
 
 /* ------------------------------------------------------------------ *
- * Login page: validation and storage
+ * Add-account page: validation and storage
  *
- * Deleting or storing an account is upstream's business, so this endpoint only
- * forwards to upstream's own OAuth validation and account channels. It does not
- * write to the store itself - that would duplicate (and could contradict) the
- * credential encryption and de-duplication upstream already does.
+ * Storing is upstream's job, so this forwards to upstream's own channels rather
+ * than writing to the store. That keeps credential encryption and any
+ * de-duplication in one place.
  * ------------------------------------------------------------------ */
 async function handleLoginFinish(req, res) {
   const send = (status, payload) => {
@@ -263,13 +261,15 @@ async function handleLoginFinish(req, res) {
   const providerId = body && body.providerId
   const providerType = (body && body.providerType) || providerId
   const credentials = (body && body.credentials) || null
+  const providedName = ((body && body.name) || '').toString().trim()
 
   if (!providerId || !credentials || !Object.keys(credentials).length) {
     send(400, { ok: false, error: '缺少 providerId 或 credentials' })
     return
   }
 
-  // 1) Validate exactly as the UI's own "login with token" path does.
+  // 1) Validate exactly as the UI's own "login with token" path does, so a
+  //    mistyped or expired token fails here instead of becoming a dead account.
   let validation
   try {
     validation = await callIpc('oauth:validateToken', [{ providerId, providerType, credentials }])
@@ -283,13 +283,20 @@ async function handleLoginFinish(req, res) {
     return
   }
 
-  // 2) Store it through upstream's account channel, so encryption and any
-  //    de-duplication stay upstream's responsibility.
+  // 2) Store through upstream's account channel. The user-supplied name wins,
+  //    because with several accounts per provider the display name is the only
+  //    way to tell them apart.
   const info = validation.accountInfo || {}
+  const name = providedName
+    || info.name
+    || info.email
+    || `${providerId}-${new Date().toISOString().slice(5, 19).replace(/[-:T]/g, '')}`
+
+  let saved
   try {
-    await callIpc('accounts:add', [{
+    saved = await callIpc('accounts:add', [{
       providerId,
-      name: info.name || info.email || providerId + '-' + Date.now(),
+      name,
       email: info.email || undefined,
       credentials,
     }])
@@ -298,8 +305,23 @@ async function handleLoginFinish(req, res) {
     return
   }
 
-  console.log(`[front] login page stored an account for ${providerId}`)
-  send(200, { ok: true, account: { name: info.name || null, email: info.email || null } })
+  // Report how many this provider now has, so the page can show progress.
+  let count = null
+  try {
+    const all = await callIpc('accounts:getAll', [false])
+    if (Array.isArray(all)) {
+      count = all.filter((a) => a && a.providerId === providerId).length
+    }
+  } catch {
+    /* the count is a nicety; storing already succeeded */
+  }
+
+  console.log(`[front] stored account "${name}" for ${providerId} (now ${count ?? '?'})`)
+  send(200, {
+    ok: true,
+    account: { name, email: info.email || null, id: saved && saved.id },
+    providerAccountCount: count,
+  })
 }
 
 function handleEvents(req, res) {
@@ -421,7 +443,6 @@ function createServer() {
     if (urlPath === '/__ipc/events') { handleEvents(req, res); return }
     if (urlPath === '/__preload.js') { servePreload(res); return }
 
-    // The guided login page and the endpoint it posts to.
     if (urlPath === '/__login') {
       sendFile(res, LOGIN_PAGE, 'text/html; charset=utf-8', false)
       return

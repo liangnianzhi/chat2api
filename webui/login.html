@@ -12,7 +12,7 @@
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
          font:14px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .wrap { max-width:760px; margin:0 auto; padding:28px 20px 60px; }
+  .wrap { max-width:780px; margin:0 auto; padding:28px 20px 60px; }
   h1 { font-size:18px; margin:0 0 4px; }
   .sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
@@ -34,7 +34,8 @@
   .steps li { margin:8px 0; }
   code { background:#0c0e12; padding:1.5px 6px; border-radius:4px; font-size:12px;
          font-family:ui-monospace,Menlo,Consolas,monospace; color:#9fd0ff; }
-  .msg { padding:11px 13px; border-radius:6px; margin-top:12px; font-size:13px; display:none; }
+  .msg { padding:11px 13px; border-radius:6px; margin-top:12px; font-size:13px;
+         display:none; white-space:pre-wrap; }
   .msg.show { display:block; }
   .msg.ok { background:#12261a; color:var(--ok); border:1px solid #1f4d2c; }
   .msg.err { background:#2d1416; color:var(--err); border:1px solid #5c2226; }
@@ -46,8 +47,13 @@
   .keypoint h3 { margin:0 0 8px; font-size:13px; color:#7fb2ff; }
   .keypoint p { margin:6px 0; color:var(--muted); font-size:13px; }
   .keypoint b { color:var(--fg); }
-  .multi { background:#0c0e12; border-radius:6px; padding:10px 12px; margin-top:12px;
+  .multi { background:#0c0e12; border-radius:6px; padding:10px 12px; margin-top:10px;
            font-size:12.5px; color:var(--muted); }
+  .multi table { width:100%; border-collapse:collapse; margin-top:8px; }
+  .multi td { padding:4px 8px; border-bottom:1px solid #1a1f28; vertical-align:top; }
+  .multi td:first-child { color:var(--fg); white-space:nowrap; width:1%; }
+  ul.acc { margin:6px 0 0; padding-left:20px; }
+  ul.acc li { margin:3px 0; }
 </style>
 </head>
 <body>
@@ -62,20 +68,28 @@
 
   <div id="main" style="display:none">
     <div class="keypoint">
-      <h3>先说清楚：为什么这里要你手动粘贴</h3>
-      <p>厂商官网（比如 <code>chat.deepseek.com</code>）登录后的凭证存在<b>你自己浏览器的存储里</b>，
-         其他域名（包括本容器）按浏览器安全规则<b>读不到</b>。要自动读，就必须在容器里跑一个完整浏览器内核，
-         那是 500MB+ 的代价，与这个轻量镜像的初衷相背。</p>
+      <h3>为什么这些字段要手动粘贴</h3>
+      <p>厂商官网（如 <code>chat.deepseek.com</code>）登录后的凭证存在<b>你自己浏览器的存储里</b>，
+         其他域名（包括本容器）按浏览器同源策略<b>读不到</b>。要自动读就得在容器里跑完整浏览器内核，
+         那是 500MB+ 的代价。</p>
       <p>所以这里做的是：<b>告诉你取哪个字段</b>，你粘一次，容器加密存下来。</p>
     </div>
 
     <div class="keypoint">
-      <h3>可以在同一浏览器里添加多个账号吗？可以。</h3>
-      <p>关键点：<b>容器里每个账号存的是它自己的 token，与你浏览器是否还在登录无关。</b></p>
-      <p>所以流程是：登录账号 A → 复制 token → 粘到下面保存 → 退出登录 → 登录账号 B → 复制 token → 再保存一次。</n         两个账号都会在容器里共存，由它自己轮询调度。</p>
+      <h3>多个同厂商账号怎么加（不会互相踢）</h3>
+      <p>先说结论：<b>容器里每个账号存的是自己的 token，互不影响。</b>
+         加完一个账号后，即使你在浏览器里退出登录，容器里的那个账号依然可用。</p>
+      <p>真正需要注意的是 <b>取 token 的那一刻</b>：如果你在同一个浏览器窗口里登第二个号，
+         第一个号在<b>厂商网站上</b>会被登出（新号替换旧会话）。此时旧 token 通常仍在容器里有效，
+         但如果厂商发现异地/多会话，可能把旧 token 作废。</p>
+      <p>稳妥做法是<b>用隔离的窗口登不同的号</b>，这样两家会话互不干扰：</p>
       <div class="multi">
-        唯一需要注意的是：如果你用 <b>同一个浏览器</b>登录第二个账号，第一个账号在**厂商网站上**会被登出 ——
-        但那不影响已经保存在容器里的 token。除非那个 token 被厂商作废（比如主动“退出所有设备”），否则持续有效。
+        <table>
+          <tr><td>Chrome / Edge</td><td>为每个账号开一个<b>独立浏览器配置文件</b>（右上角头像 → 添加），或用<b>无痕窗口</b>（快捷键 Ctrl+Shift+N）</td></tr>
+          <tr><td>Firefox</td><td><b>多账户容器</b>（Multi-Account Containers 扩展），或容器标签页</td></tr>
+          <tr><td>Safari</td><td><b>新建隐私浏览窗口</b>（Cmd+Shift+N）</td></tr>
+        </table>
+        <p style="margin:8px 0 0">无痕窗口关掉就清空，所以取完 token 直接关闭即可，不会与主窗口的账号互相踩到。</p>
       </div>
     </div>
 
@@ -85,6 +99,9 @@
         在新标签页里登录，然后回到本页完成第 2 步。要加多个账号，重复整个流程即可。
       </p>
       <button class="primary wide" id="btnOpen">打开 <span id="siteName">登录页</span></button>
+      <div class="row">
+        <button id="btnOpenIncognito">用无痕窗口打开（推荐加第二个账号时用）</button>
+      </div>
       <div class="msg" id="openMsg"></div>
     </div>
 
@@ -94,7 +111,7 @@
       <label id="fieldLabel" for="tokenInput">粘贴凭证</label>
       <textarea id="tokenInput" placeholder="在这里粘贴"></textarea>
       <label for="acctName">账号备注名（多账号时便于区分）</label>
-      <input id="acctName" placeholder="例如 账号1、备用号、主号">
+      <input id="acctName" placeholder="例如 主号、备用号">
       <div class="row">
         <button class="primary" id="btnSubmit">验证并添加</button>
         <button id="btnClear">清空</button>
@@ -108,9 +125,9 @@
     </div>
 
     <div class="card">
-      <h2>已添加的账号</h2>
+      <h2>这个提供商已有的账号</h2>
       <div id="acctList" class="note">读取中…</div>
-      <div class="note">添加成功后可以直接重复第 1、2 步继续加，不需要关闭本页。</div>
+      <div class="note">添加成功后可以继续重复第 1、2 步，不需要刷新本页。</div>
     </div>
   </div>
 </div>
@@ -121,11 +138,12 @@
 /*
  * 添加账号的引导页。
  *
- * 为什么需要它：上游的「网页登录」在 Electron 里开一个窗口，用 webContents
- * 直接读窗口里的 localStorage / cookie。容器里没有窗口，那条路不可能跑通。
+ * 上游的「网页登录」在 Electron 里开窗口，用 webContents 直接读窗口里的
+ * localStorage / cookie（而且每次登录用 persist:oauth-<时间戳> 的独立分区，
+ * 所以上游本来就能多账号并存）。容器里没有窗口，那条路不可能跑通。
  *
- * 而跨域站点（chat.deepseek.com）的存储，浏览器禁止本页读取 —— 这是安全边界。
- * 所以这里是「说清取哪个字段 + 提交前先验证」，不是伪自动。
+ * 而跨域站点的存储，浏览器禁止本页读取 —— 这是同源策略，不是能绕过的实现细节。
+ * 所以这里讲清楚两件事：取哪个字段，以及多账号时怎么避免互相踩。
  */
 
 function qs(name) {
@@ -244,8 +262,7 @@ if (!cfg.provider) {
   document.getElementById('subtitle').textContent = '登录官网 → 复制凭证 → 粘到下面。可重复多次添加多个账号。';
   document.getElementById('siteName').textContent = siteName + ' 登录页';
 
-  const stepsEl = document.getElementById('steps');
-  stepsEl.innerHTML = hint
+  document.getElementById('steps').innerHTML = hint
     ? hint.steps.map(function (s) { return '<li>' + s + '</li>'; }).join('')
     : '<li>打开登录页并登录</li><li>从开发者工具取出 token 或 cookie</li><li>粘贴到下方保存</li>';
 
@@ -266,19 +283,32 @@ if (!cfg.provider) {
     }
   }
 
-  document.getElementById('btnOpen').onclick = function () {
+  function openTab() {
     if (!loginUrl) {
       showMsg(document.getElementById('openMsg'), '这个提供商的登录地址未知，请手动打开官网登录。', 'warn');
       return;
     }
-    // 在当前手势里直接打开，不经后端，不会被拦。
     const w = window.open(loginUrl, '_blank');
     if (w) {
       try { w.opener = null; } catch (e) {}
-      showMsg(document.getElementById('openMsg'), '已打开登录页。登录完成后回到本页粘贴凭证。', 'ok');
+      showMsg(document.getElementById('openMsg'),
+        '已打开登录页。登录完成后回到本页粘贴凭证。', 'ok');
     } else {
-      showMsg(document.getElementById('openMsg'), '浏览器拦截了新标签页，请手动打开：' + loginUrl, 'warn');
+      showMsg(document.getElementById('openMsg'),
+        '浏览器拦截了新标签页，请手动打开：' + loginUrl, 'warn');
     }
+  }
+
+  document.getElementById('btnOpen').onclick = openTab;
+
+  document.getElementById('btnOpenIncognito').onclick = function () {
+    // 隐私窗口必须由用户自己开（网页无法命令浏览器开无痕），这里只给出指引。
+    showMsg(document.getElementById('openMsg'),
+      '无痕窗口需要你手动打开：\n'
+      + 'Chrome / Edge：Ctrl+Shift+N（Mac 是 Cmd+Shift+N）\n'
+      + 'Firefox：Ctrl+Shift+P\n'
+      + 'Safari：Cmd+Shift+N\n\n'
+      + '在新开的无痕窗口里访问：' + (loginUrl || '（该提供商登录地址未知）'), 'warn');
   };
 
   document.getElementById('btnClear').onclick = function () {
@@ -298,13 +328,18 @@ if (!cfg.provider) {
       });
       const data = await resp.json();
       const list = (data && data.ok && data.result) || [];
-      const mine = list.filter(function (a) { return a.providerId === cfg.providerId || a.providerId === cfg.provider; });
+      const target = cfg.providerId || cfg.provider;
+      const mine = list.filter(function (a) { return a && a.providerId === target; });
+
       if (!mine.length) {
-        el.textContent = '这个提供商下还没有账号。';
+        el.innerHTML = '这个提供商下还没有账号。添加后会显示在这里。';
         return;
       }
-      el.innerHTML = '<b>' + mine.length + ' 个：</b>'
-        + mine.map(function (a) { return a.name + ' (' + (a.status || '?') + ')'; }).join('、');
+      el.innerHTML = '<b>已有 ' + mine.length + ' 个：</b><ul class="acc">'
+        + mine.map(function (a) {
+            return '<li>' + (a.name || '(未命名)') + ' — 状态 ' + (a.status || '?') + '</li>';
+          }).join('')
+        + '</ul>';
     } catch (e) {
       el.textContent = '读取账号列表失败：' + e.message;
     }
@@ -344,7 +379,10 @@ if (!cfg.provider) {
 
       if (data && data.ok) {
         const who = (data.account && data.account.name) || '账号';
-        showMsg(msg, '已添加：' + who + '。可以继续添加下一个账号。', 'ok');
+        const total = data.providerAccountCount;
+        showMsg(msg,
+          '已添加：' + who + (total ? '（该提供商现在共 ' + total + ' 个账号）' : '')
+          + '\n可以继续添加下一个：重复第 1、2 步即可，建议用无痕窗口登录新账号。', 'ok');
         document.getElementById('tokenInput').value = '';
         document.getElementById('acctName').value = '';
         await loadAccounts();

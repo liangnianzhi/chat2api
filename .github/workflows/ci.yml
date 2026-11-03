@@ -399,7 +399,10 @@ jobs:
               | while IFS= read -r l; do echo "::error title=verify-log::${l//'%'/'%25'}"; done
             exit 1
           fi
-          VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh > /tmp/verify.log 2>&1
+          # CONTAINER 让套件能从**这个**容器里读管理密钥；不给的话它会去读
+          # 一个不存在的 chat2api-smoke，四十多条带凭据的断言就全部退化成 401。
+          VERIFY_URL=http://127.0.0.1:18083 CONTAINER=c2a-http \
+            bash tests/smoke.sh > /tmp/verify.log 2>&1
           verify_ec=$?
           cat /tmp/verify.log
           {

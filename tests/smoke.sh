@@ -773,6 +773,11 @@ catch { process.exit(0) }
   fi
 fi
 
+# 只有自己起容器时才验证「发布默认」：VERIFY_URL 模式下容器是外面起来的，
+# 再起一个会落在别的端口上，断言看到的就不是同一个进程了。
+if [ -n "$VERIFY_URL" ]; then
+  info "局域网默认：外部容器由 CI 按发布默认起好，这里不重复起容器"
+else
 info "局域网默认：发布出去的就是「不登录」"
 # 上面的 401/403 断言之所以成立，是因为 start_container 把门 pin 开了。
 # 这里按发布默认（不设 CHAT2API_REQUIRE_AUTH）再起一次，确认开箱即用。
@@ -794,6 +799,8 @@ if SMOKE_GATE=0 start_container >/dev/null 2>&1 && wait_ready; then
     || fail "门关闭时跨站 Origin -> HTTP $CODE（应为 403）"
 else
   fail "门关闭时容器 60 秒内没有就绪"
+fi
+
 fi
 
 if [ "$FAILED" = 0 ]; then

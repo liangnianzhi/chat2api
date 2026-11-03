@@ -24,6 +24,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # lint 用的是 bash 4 的数组/[[ ]]（tests/smoke.sh 就是这么写的），
+      # GitHub 的 ubuntu runner 默认 sh 是 dash，bash -n 会把它们当成语法错误。
+      # runner 自带 bash 5.x，这里先把它报出来，失败时好判断是谁的问题。
+      - name: Bash
+        run: bash --version | head -1
+
       # 跑 lint 需要 node：脚本里的 "Node syntax" 与 docs_claims.js 两段都要它，
       # 没有 node 时前者在 set -u 下直接跳段、后者变成 SKIP，等于两个检查都不存在。
       # 版本跟镜像一致（Dockerfile 用 node:20-alpine）。

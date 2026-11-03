@@ -176,30 +176,31 @@ else
 fi
 
 info 'Executable bit on entrypoints'
-# 检查两件事，缺一不可：文件在磁盘上可执行，且 git 记的 mode 也是 755。
-# 反过来的顺序曾经害过人：先看 [ -x ]，于是 Windows 工作区（core.fileMode
-# 为 false、磁盘上一律 755）永远通过，100644 那条分支根本走不到——而
-# Linux 上 checkout 出来的正是 644，镜像里 exec 直接 126/127。
-# 不看 git 索引时（tarball、CI artifact），只要求磁盘上可执行。
-for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
-  [ -f "$f" ] || continue
-  if command -v git >/dev/null 2>&1 && [ -n "$(git ls-files -s -- "$f" 2>/dev/null)" ]; then
+# 入口要从别处被 exec（deploy.sh 在 NAS 上、entrypoint.sh 在镜像里），所以
+# 必须能在 Linux 上直接执行。检查顺序有讲究：
+#   * 树里有 .git 时，以 git 记的 mode 为准。先看 [ -x ] 曾经害过人：
+#     Windows 工作区 core.fileMode=false、磁盘上一律 755，检查永远通过，
+#     而 Linux checkout 出来的正是 644（126/127 就是这么来的）。
+#   * 没有 .git（tarball、CI artifact）时，看磁盘上的可执行位。
+if [ -d .git ]; then
+  for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
+    [ -f "$f" ] || continue
     mode="$(git ls-files -s -- "$f" | cut -d' ' -f1)"
     case "$mode" in
       100755) pass "executable (git mode 755): $f" ;;
       100644) fail "not executable: $f (git mode 644 -- chmod +x and commit)" ;;
-      *) pass "executable bit not tracked: $f" ;;
+      '')     fail "not tracked by git: $f" ;;
+      *)      pass "executable bit not tracked: $f" ;;
     esac
-  elif [ -x "$f" ]; then
-    pass "executable (no git index): $f"
-  else
-    # 走到这里说明两件事：文件不可执行，而且没有 git 索引能说明它本该是
-    # 什么 mode。镜像构建时会给入口设权限，所以这未必是错，但"无从得知"
-    # 不能显示成"检查通过"——那正是前面几处空转的共同形状。
-    fail "not executable: $f (no git index to vouch for it)"
-  fi
-done
-
+  done
+else
+  for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
+    [ -f "$f" ] || continue
+    if [ -x "$f" ]; then pass "executable: $f"; else
+      fail "not executable: $f (chmod +x)"
+    fi
+  done
+fi
 info 'Documented claims that go stale'
 # tests/docs_claims.js turns the README's testable statements (script inventory,
 # tuning defaults, routes, tuning table) into assertions against the code, so

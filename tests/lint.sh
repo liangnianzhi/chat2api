@@ -176,6 +176,9 @@ else
 fi
 
 info 'Executable bit on entrypoints'
+# 仓库里记的是 100644，Windows 工作区一律显示 755 —— 谁也不该指望人记得 chmod。
+#   git update-index --chmod=+x deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh
+
 # 入口要从别处被 exec（deploy.sh 在 NAS 上、entrypoint.sh 在镜像里），所以
 # 必须能在 Linux 上直接执行。检查顺序有讲究：
 #   * 树里有 .git 时，以 git 记的 mode 为准。先看 [ -x ] 曾经害过人：

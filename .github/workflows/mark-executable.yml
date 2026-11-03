@@ -41,3 +41,15 @@ jobs:
 
           # trigger 是 workflow_dispatch 时 HEAD 指向 main；detached 也一并兜住。
           git push origin 'HEAD:main'
+
+      # GITHUB_TOKEN 推的提交不会自动触发别的 workflow（防递归），
+      # 但 workflow_dispatch 是官方明说的例外，所以这里直接把构建打起来，
+      # 省掉"再点一次 build"。失败也不影响 mode 已经改好这件事。
+      - name: Kick off the build workflow
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run ci.yml --ref main \
+            && echo 'build 已排队，去 Actions 看 build 的最新一次运行' \
+            || echo '自动触发失败：请手动 Actions -> build -> Run workflow'

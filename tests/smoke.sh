@@ -180,8 +180,14 @@ read_host_secret() {
 load_secret() {
   [ -n "$SECRET" ] && return 0
   if [ -n "$VERIFY_URL" ]; then
+    # 外部部署这一支只有容器里的路径（SECRET_FILE 是 /data/... ），宿主机上通常
+    # 读不到：先按本机部署的情况试一次宿主文件，读不到就从被测容器里取。
     if [ -r "$SECRET_FILE" ]; then
       SECRET="$(tr -d '\r\n' < "$SECRET_FILE")"
+    fi
+    if [ -z "$SECRET" ]; then
+      mark "secret: verify exec"
+      SECRET="$(in_container "cat $SECRET_FILE" 2>/dev/null | tr -d '\r\n')"
     fi
   else
     # 容器把 $WORKDIR/data 挂到 /data，所以密钥在宿主机上就是一份普通文件。
@@ -773,11 +779,6 @@ catch { process.exit(0) }
   fi
 fi
 
-# 只有自己起容器时才验证「发布默认」：VERIFY_URL 模式下容器是外面起来的，
-# 再起一个会落在别的端口上，断言看到的就不是同一个进程了。
-if [ -n "$VERIFY_URL" ]; then
-  info "局域网默认：外部容器由 CI 按发布默认起好，这里不重复起容器"
-else
 info "局域网默认：发布出去的就是「不登录」"
 # 上面的 401/403 断言之所以成立，是因为 start_container 把门 pin 开了。
 # 这里按发布默认（不设 CHAT2API_REQUIRE_AUTH）再起一次，确认开箱即用。
@@ -799,8 +800,6 @@ if SMOKE_GATE=0 start_container >/dev/null 2>&1 && wait_ready; then
     || fail "门关闭时跨站 Origin -> HTTP $CODE（应为 403）"
 else
   fail "门关闭时容器 60 秒内没有就绪"
-fi
-
 fi
 
 if [ "$FAILED" = 0 ]; then

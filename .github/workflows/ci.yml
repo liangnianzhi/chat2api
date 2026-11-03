@@ -182,77 +182,79 @@ jobs:
       # （匿名 403，读不到）和 job summary 里（只有 exit code）都看不见。
       # 现在：把 ps / 完整容器日志 / 健康检查结果全部打进 step summary，
       # 并把最后几行转成 ::error 注解，这样失败原因在 check-run 上就能读到。
-      - name: Bring the stack up via compose
-        run: |
           mkdir -p data
+          # 诊断原则：每一条线索要么进 job summary，要么变成注解。job log 读不到（匿名 403），
+          # 所以只在 echo 里出现的信息等于没记。
           set +e
-          # 两条线索互相对照：一是 compose 自己的 stdout/stderr，二是容器自己
-          # 打印的日志。只留其中一条时，"容器起没起"和"容器说了什么"会混在一起。
-          docker compose up -d > /tmp/up.log 2>&1
+          # 先把镜像里该有的东西验一遍：不用起服务，就能区分"镜像是坏的"和"服务起不来"。
+          echo '--- image probe (no service started) ---'
+          timeout 60 docker run --rm --entrypoint sh ${{ env.IMAGE_REF }} -c '
+            set -x; id; ls -l /app/shim/entrypoint.sh; head -1 /app/shim/entrypoint.sh;
+            node -v; ls -d /app/upstream/main /app/webui /app/shim;
+            su-exec --help 2>&1 | head -2; command -v curl tini' > /tmp/probe.log 2>&1
+          probe_ec=$?
+          # 再真的起一次，stdout 与容器日志分开存（上一次两者混在一个文件里，结果两条都是空的）。
+          timeout 90 docker compose up -d > /tmp/up.log 2>&1
           up_ec=$?
-          docker compose ps -a > /tmp/ps.log 2>&1
-          docker compose logs --no-color --timestamps > /tmp/app.log 2>&1
-          sleep 3
-          docker compose logs --no-color --timestamps > /tmp/app.log 2>&1
           ok=no
-          for i in $(seq 1 90); do
+          for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:8082/health >/dev/null 2>&1; then ok=yes; break; fi
             sleep 2
           done
+          docker compose logs --no-color --timestamps > /tmp/app.log 2>&1
+          docker compose ps -a > /tmp/ps.log 2>&1
+          docker inspect chat2api > /tmp/inspect.log 2>&1
           {
             echo '### compose up'
             echo
-            echo "- up exit: $up_ec"
-            echo "- /health reachable within 180s: $ok"
+            echo "- image probe exit: $probe_ec"
+            echo "- compose up exit: $up_ec"
+            echo "- /health reachable within 120s: $ok"
+            echo "- container still running: $(docker inspect -f '{{.State.Running}}' chat2api 2>/dev/null || echo 'no container')"
             echo
-            echo '<details><summary>docker compose ps -a</summary>'
-            echo
-            echo '```'
-            docker compose ps -a 2>&1 || true
-            echo '```'
-            echo '</details>'
-            echo
-            echo '<details><summary>docker compose logs (full)</summary>'
+            echo '<details><summary>image probe</summary>'
             echo
             echo '```'
-            docker compose logs --no-color 2>&1 || true
+            cat /tmp/probe.log 2>/dev/null || true
             echo '```'
             echo '</details>'
             echo
-            echo '<details><summary>docker compose up output</summary>'
+            echo '<details><summary>compose up output</summary>'
             echo
             echo '```'
-            cat /tmp/up.log 2>&1 || true
+            cat /tmp/up.log 2>/dev/null || true
+            echo '```'
+            echo '</details>'
+            echo
+            echo '<details><summary>container log</summary>'
+            echo
+            echo '```'
+            cat /tmp/app.log 2>/dev/null || true
+            echo '```'
+            echo '</details>'
+            echo
+            echo '<details><summary>compose ps</summary>'
+            echo
+            echo '```'
+            cat /tmp/ps.log 2>/dev/null || true
             echo '```'
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
-          # 容器日志里像错误的行转成注解（最多 20 条）。注解是 check-run 的一部分，
-          # 匿名可读——这是唯一能绕开"job log 需要登录"的通道。
-          grep -i -E 'error|panic|denied|exec format|no such file|cannot|failed' /tmp/app.log 2>/dev/null \
-            | tail -20 | while IFS= read -r r; do
-                echo "::error title=compose::${r//'%'/'%25'}"
-              done || true
-          # 起不来时做三件诊断：容器在不在、镜像里那个入口能不能跑、进程是不是
-          # 直接退出了。这三件事各自映射一种常见故障（拉取失败 / 权限位 / 启动崩溃）。
+          # 起不来时，把 4 条通道的内容都摘成注解（各取最后 10 行）。
+          # 注解属于 check-run，匿名可读——这是唯一能绕过"job log 需要登录"的路。
           if [ "$ok" != yes ]; then
-            echo '::error title=compose::/health never answered on 127.0.0.1:8082 within 180s'
-            echo '::group::container state'
-            cat /tmp/ps.log 2>/dev/null || true
-            echo "--- docker inspect (state + config):"
-            docker inspect chat2api \
-              --format '{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}} oom={{.State.OOMKilled}} startedAt={{.State.StartedAt}} finishedAt={{.State.FinishedAt}} image={{.Config.Image}} entrypoint={{.Config.Entrypoint}} cmd={{.Config.Cmd}}' 2>&1 || true
-            echo "--- 镜像里的入口与权限:"
-            docker run --rm --entrypoint sh ${{ env.IMAGE_REF }} \
-              -c 'id; ls -l /app/shim/entrypoint.sh; head -1 /app/shim/entrypoint.sh; node -v' 2>&1 || true
-            echo "--- 前台跑 20 秒，把启动阶段的输出全部抓下来:"
-            timeout 20 docker run --rm -v "$PWD/data:/data" ${{ env.IMAGE_REF }} 2>&1 | tail -60 || true
-            echo '::endgroup::'
-            echo '::error title=compose::容器没有起来，细节见上面三段的注解/job summary'
+            emit() {
+              echo "::error title=$1::$(tail -10 "$2" 2>/dev/null | tr '\n' '|' | tr -cd '[:print:] |' | cut -c1-800)"
+            }
+            emit probe /tmp/probe.log
+            emit up /tmp/up.log
+            emit container /tmp/app.log
+            emit state /tmp/ps.log
+            echo "::error title=compose::容器 120 秒内没有提供 /health（exit=$up_ec probe=$probe_ec）"
             exit 1
           fi
-
           if [ "$up_ec" != 0 ]; then
-            echo "::error title=compose::docker compose up exited $up_ec"
+            echo "::error title=compose::docker compose up 返回 $up_ec"
             exit 1
           fi
 

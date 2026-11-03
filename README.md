@@ -91,6 +91,18 @@ client = OpenAI(
 Cookie 能打开界面、取 `preload` 桥、调 IPC，但调用 `POST /__ipc` 时要额外带 `X-C2A-Request: 1`
 和 `X-C2A-CSRF`/`csrf` 字段，这正是浏览器跨站表单**无法伪造**的部分。
 
+### 默认：不做登录（内网直连）
+
+**发布默认是 `CHAT2API_REQUIRE_AUTH=0`**：容器起来就是「打开网页即用」，不弹登录页。
+这一版面向的是**局域网 / 内网单机**部署，前提是这个端口不暴露到公网。
+
+- 想恢复「必须带凭据」的模式：加一行 `-e CHAT2API_REQUIRE_AUTH=1`（或写进 compose）。
+- 下面「默认拒绝的端点」「被拒绝时返回什么」两节描述的是**开启之后**的行为。
+  关闭时仍然保留两道与身份无关的防线：同源校验（跨站表单照样 `403`）与
+  `Content-Type: application/json` 要求（免预检的表单提交照样 `415`）。
+- 状态永远是显式的：`/health` 里的 `auth.mode` 会是 `disabled` 或 `enforced`，
+  `docker compose ps` 的健康检查照常工作，不会出现「以为开着、其实关着」。
+
 ### 默认拒绝的端点
 
 - `/`、`/__preload.js`、静态资源、`/__ipc`、`/__ipc/events`、`/__ipc/config`、`/__login/finish`
@@ -356,8 +368,9 @@ cd /volume1/docker/chat2api
   不重写整个文件；
 - `/health` 的 `checks`/`warnings` 是算出来的，不落盘。
 
-**唯一需要留意的是密钥**：如果以前靠「谁都能访问」在用，现在第一次打开界面会看到登录页，
-去上一节取密码即可。
+**唯一需要留意的是密钥**：管理密钥依旧会自动生成并存在数据卷里（`data/.chat2api/.management-secret`），
+只是在默认（闸门关闭）的部署里，浏览器打开界面不再需要它；脚本、SDK、`/v1/**` 与
+`/management/**` 仍然用它作 `Authorization: Bearer`。要恢复登录页就把 `CHAT2API_REQUIRE_AUTH=1` 打开。
 
 ## 常用命令
 

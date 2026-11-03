@@ -18,7 +18,8 @@
 #   TZ                        容器时区，镜像默认 Asia/Shanghai
 #   CHAT2API_API_KEY          给 /v1 客户端访问加密钥（默认不启用）
 #   CHAT2API_MANAGEMENT_SECRET 固定管理密钥（不设则首次启动自动生成，存在 data/）
-#   CHAT2API_REQUIRE_AUTH      false 关闭访问控制（默认 true，仅限离线单机排查用）
+#   CHAT2API_REQUIRE_AUTH      0/false 关闭访问控制（**默认已关闭**：内网直连、免登录）；
+#                              设 1/true 恢复「必须带管理密钥/会话」的模式
 #   CHAT2API_TRUST_PROXY       true 时信任 X-Forwarded-* （放在反向代理后面才需要）
 #   CHAT2API_TRUSTED_ORIGINS   额外的同源白名单，逗号分隔，如 https://nas.example:5001
 #

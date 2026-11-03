@@ -86,6 +86,65 @@ function proxyHandler() {
 }
 
 /* ------------------------------------------------------------------ *
+ * Statistics (shim/observability) - ours to answer, not upstream's
+ * ------------------------------------------------------------------ */
+let observability = null
+try {
+  observability = require(path.join(APP_DIR, 'shim', 'observability', 'install.js'))
+} catch (err) {
+  console.warn('[front] observability layer unavailable (' + err.message
+    + '); /management/statistics keeps answering from upstream')
+}
+
+let managementStore = null
+/**
+ * The store manager upstream's own routes consult. Cached: it is created once,
+ * during boot, and asking the export graph on every probe would be a walk for
+ * an answer that cannot change.
+ */
+function managementStoreManager() {
+  if (managementStore) return managementStore
+  try {
+    const graph = shim && typeof shim.__upstreamExports === 'function' ? shim.__upstreamExports() : null
+    const candidates = [
+      graph && graph.storeManager, graph && graph.store, graph && graph.StoreManager,
+      globalThis.__chat2apiStore,
+    ]
+    managementStore = candidates.find((c) => c && typeof c.getConfig === 'function') || null
+  } catch (err) {
+    managementStore = null
+  }
+  return managementStore
+}
+
+/**
+ * Answer /management/statistics (and its /v0 alias) from this layer.
+ *
+ * The observability layer wraps upstream's own handler, but that hook needs the
+ * handler to exist at install time; on a cold start it does not, and the
+ * request then reaches upstream's thinner numbers with no X-C2A-Observability
+ * header. The front layer is always in the path, so the aggregate is served
+ * here and the header always means what it says.
+ *
+ * answerStatistics() carries the management gate itself (404 when disabled,
+ * 500 without a secret, 401 on a missing or wrong one), so answering here
+ * cannot become a way around the gate. Returns true once the reply is written.
+ */
+function serveStatistics(req, res, urlPath) {
+  if (!observability || typeof observability.answerStatistics !== 'function') return false
+  const paths = observability.STATS_PATHS
+  if (!paths || typeof paths.has !== 'function') return false
+  const clean = String(urlPath || '').split('?')[0].replace(/\/+$/, '') || '/'
+  if (!paths.has(clean)) return false
+  const manager = managementStoreManager()
+  try {
+    return observability.answerStatistics(req, res, manager ? { storeManager: manager } : {}) === true
+  } catch (err) {
+    console.error('[front] statistics failed, falling through to upstream:', err && err.message)
+    return false
+  }
+}
+/* ------------------------------------------------------------------ *
  * Health probe (shim/health.js) - optional, falls back to a minimal body
  * ------------------------------------------------------------------ */
 let health = null
@@ -592,6 +651,48 @@ function prepareForGateway(req, urlPath, ctx) {
  * healthy; a broken store or a missing proxy answers 503 so HEALTHCHECK and
  * docker compose report the container unhealthy instead of pretending.
  */
+/**
+ * What the self-heal layer reports about itself: is the module there, is it
+ * allowed to act, and which of its seams failed to attach. Mirrors
+ * shim/health.js's read of the same global, but composed here so /health
+ * carries it even when the ops module answers a thin body.
+ */
+function selfhealView() {
+  const hook = globalThis.__chat2apiSelfHeal
+  if (!hook || typeof hook !== 'object') return { installed: false, enabled: false, missing: [] }
+  let snap = null
+  try {
+    snap = typeof hook.snapshot === 'function' ? hook.snapshot() : null
+  } catch (err) {
+    snap = null
+  }
+  if (!snap || typeof snap !== 'object') return { installed: false, enabled: false, missing: [] }
+  const seams = snap.installed && typeof snap.installed === 'object' ? snap.installed : {}
+  let info = null
+  try {
+    info = typeof hook.info === 'function' ? hook.info() : null
+  } catch (err) {
+    info = null
+  }
+  const enabled = info && typeof info.enabled === 'boolean'
+    ? info.enabled
+    : !(snap.config && typeof snap.config === 'object' && snap.config.enabled === false)
+  const list = (value) => (Array.isArray(value) ? value.slice() : [])
+  return {
+    installed: true,
+    enabled: enabled,
+    missing: list(seams.missing),
+    seams: {
+      requestPath: Boolean(seams.requestPath),
+      accountPicker: Boolean(seams.accountPicker),
+      balancer: Boolean(seams.balancer),
+      routeObserver: Boolean(seams.routeObserver),
+      tokenCaches: list(seams.tokenCaches),
+      reasonPatches: list(seams.reasonPatches),
+    },
+  }
+}
+
 async function serveHealth(req, res) {
   let report
   try {
@@ -614,6 +715,16 @@ async function serveHealth(req, res) {
     payload = Object.assign({}, report, { auth: auth.snapshotAuth() })
   } catch (err) {
     payload = Object.assign({}, report, { auth: { error: 'snapshot_failed' } })
+  }
+  // The self-heal layer installs itself through a global and is optional, so
+  // the probe must say whether it is there and - when it is - which seams it
+  // could not attach to. Without this, a container that lost the layer is
+  // indistinguishable from a healthy one in exactly the machine-readable way
+  // an operator needs.
+  try {
+    payload.selfheal = selfhealView()
+  } catch (err) {
+    payload.selfheal = { installed: false, enabled: false, missing: [] }
   }
 
   let body
@@ -654,6 +765,9 @@ function minimalHealthSafe() {
 
 function dispatch(req, res, urlPath, ctx) {
   prepareForGateway(req, urlPath, ctx)
+  // Aggregates first: this reply is ours, and answering it through the
+  // captured handler is what silently degraded when that hook missed.
+  if (serveStatistics(req, res, urlPath)) return
 
   const handler = proxyHandler()
   if (!handler) {

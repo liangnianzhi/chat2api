@@ -470,7 +470,10 @@ function audit(entry) {
   process.stdout.write('[audit] ' + text + '\n')
   // Also into the ring buffer that /health exposes to an operator (see
   // snapshotAuth()); counts and redacted reasons only, never a credential.
-  auditRecent.push(text)
+  // Same shape as the line written to stdout, prefix included: /health shows
+  // these verbatim, and an operator greps the log and the probe with the same
+  // pattern. The record itself is unchanged (it is still the JSON line).
+  auditRecent.push('[audit] ' + text)
   if (auditRecent.length > AUDIT_RING) auditRecent.shift()
 }
 

@@ -64,6 +64,8 @@ start_container() {
     -p "127.0.0.1:${PORT}:8082" \
     -v "$WORKDIR/data:/data" \
     -e "CHAT2API_REQUIRE_AUTH=${SMOKE_GATE:-1}" \
+    --log-opt max-size=10m \
+    --log-opt max-file=3 \
     "$IMAGE" >"$WORKDIR/run.log" 2>&1 || rc=$?
   if [ "$rc" != 0 ]; then
     # docker run 自己失败时，stderr 才是原因，而且它不会进 job log（匿名看不到）。
@@ -380,7 +382,7 @@ grep -q '/__login/finish' <<<"$LOGIN_HTML" \
 # 提交登录必须带上会话和 CSRF 令牌：会话 cookie 是 SameSite=Strict 的，
 # 跨站表单既带不上 cookie，也猜不出这里的值。
 CSRF="$(curl -s -b "$COOKIE_JAR" -c "$COOKIE_JAR" "${BASE}/__login" \
-  | tr -d '\r\n' | sed -n 's/.*name="csrf" content="\([a-f0-9]*\)".*/\1/p' | head -1)"
+  | tr -d '\r\n' | sed -n 's/.*name="c2a-csrf-token" content="\([a-f0-9]*\)".*/\1/p' | head -1)"
 [ -n "$CSRF" ] && pass "登录页给出 CSRF 令牌" || fail "登录页没有 CSRF 令牌"
 
 NOAUTH_FINISH="$(code_of -X POST "${BASE}/__login/finish" -H "$JSON" -d '{}')"

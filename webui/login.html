@@ -61,6 +61,17 @@
   <h1 id="title">添加账号</h1>
   <div class="sub" id="subtitle">正在加载…</div>
 
+  <div class="card">
+    <h2>先登录一次（管理密码）</h2>
+    <p style="margin:0 0 8px">这台浏览器还没拿到访问凭证。管理密码就是容器里的管理密钥，
+      首次部署时自动生成，存在数据卷的 <code>.chat2api/.management-secret</code>。</p>
+    <p style="margin:0 0 4px;color:var(--muted)">在一台能连到本机的机器上取一次：</p>
+    <pre style="margin:0 0 8px;white-space:pre-wrap"><code>docker compose exec chat2api cat /data/.chat2api/.management-secret</code></pre>
+    <p style="margin:0 0 4px;color:var(--muted)">NAS 上直接读数据卷（把路径换成你的挂载点）：</p>
+    <pre style="margin:0;white-space:pre-wrap"><code>sudo cat /volume1/docker/chat2api/data/.chat2api/.management-secret</code></pre>
+    <div class="msg" id="authMsg"></div>
+  </div>
+
   <div class="card" id="badParams" style="display:none">
     <h2>参数缺失</h2>
     <p style="margin:0">这个页面需要由管理界面打开。请回到 Chat2API 界面，在「添加账号」里再试。</p>

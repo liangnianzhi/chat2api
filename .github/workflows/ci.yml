@@ -185,6 +185,15 @@ jobs:
       - name: Bring the stack up via compose
         run: |
           mkdir -p data
+          # docker-compose.yml 是给群晖写的：它把 personal 声明成 external 网络
+          # （群晖上那是既有的共享网络，反向代理和其他容器都挂在上面）。
+          # runner 上没有这个网络，compose 会直接 'network personal declared as
+          # external, but could not be found' —— 之前 CI 一直是死在这一句，而
+          # 它发生在容器创建之前，所以容器日志是空的、看起来像"容器起不来"。
+          # 这里在 runner 上就地建一个同名的桥接网络，测的还是仓库里那份 yml，
+          # 不另写一份"CI 专用 compose"（那样测的就不是要交付的东西了）。
+          docker network inspect personal >/dev/null 2>&1 \
+            || docker network create personal >/dev/null
           # 诊断原则：每一条线索要么进 job summary，要么变成注解。job log 读不到（匿名 403），
           # 所以只在 echo 里出现的信息等于没记。
           set +e

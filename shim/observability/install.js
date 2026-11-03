@@ -480,11 +480,12 @@ function answerStatistics(req, res, opts) {
   if (!STATS_PATHS.has(pathname)) return false
   // This hook sits IN FRONT of upstream's handler, so upstream's own auth never
   // runs for a request we answer: answering without a check would publish the
-  // management surface to anyone who can reach the port. Upstream guards these
-  // routes with the same Bearer secret a client uses (and treats "no secret
-  // generated yet" as open, because it creates one on first use), so this check
-  // follows the same rule - no stricter, or a healthy deployment would fail our
-  // own smoke test while the real endpoint would have answered it.
+  // management surface to anyone who can reach the port. So the check below
+  // mirrors managementAuthMiddleware from the bundle: /v0/management answers 404
+  // while the management API is disabled (the default), 500 when it is enabled
+  // but has no secret, and 401 otherwise unless the Bearer secret matches. Being
+  // stricter than upstream would fail a healthy deployment; being looser is the
+  // hole this commit exists to close.
   const guard = checkManagementAuth(req, opts)
   if (guard.status !== 200) {
     return replyJson(res, method, guard.status, {
@@ -519,38 +520,63 @@ function replyJson(res, method, status, payload, extraHeaders) {
 /* Management auth - the rule the endpoint behind us would apply        */
 /* ------------------------------------------------------------------ */
 
-/** Where upstream generates the secret on first use (same path shim/health.js reads). */
-function managementSecretFile(opts) {
-  if (opts && opts.secretFile) return opts.secretFile
-  const home = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
-  return path.join(home, '.management-secret')
-}
-
-function readManagementSecret(opts) {
-  const fromEnv = process.env.CHAT2API_MANAGEMENT_SECRET
-  if (fromEnv && String(fromEnv).trim()) return String(fromEnv).trim()
+/** The management config block upstream keeps in its store, or null. */
+function managementConfig(opts) {
   try {
-    const file = managementSecretFile(opts)
-    if (!fs.existsSync(file)) return ''
-    return String(fs.readFileSync(file, 'utf8')).trim()
-  } catch {
-    return ''
-  }
+    if (opts && opts.managementConfig) return opts.managementConfig
+    const mgr = opts && opts.storeManager
+    if (mgr && typeof mgr.getConfig === 'function') {
+      const cfg = mgr.getConfig()
+      if (cfg && typeof cfg === 'object') return cfg.managementApi || null
+    }
+  } catch { /* an unreadable store is reported below, not thrown */ }
+  return null
 }
 
-function bearerOf(req) {
-  const headers = (req && req.headers) || {}
-  const raw = headers.authorization || headers.Authorization || ''
-  const m = /^Bearer\s+(.+)$/i.exec(String(raw))
-  return m ? m[1].trim() : ''
-}
-
-/** Constant-time compare; falls back to === when lengths differ (timing is moot). */
-function sameSecret(presented, expected) {
+function timingSafeMatch(presented, expected) {
   const a = Buffer.from(String(presented))
   const b = Buffer.from(String(expected))
   if (a.length !== b.length) return false
   return timingSafeEqual(a, b)
+}
+
+/** Bearer token, or the X-Management-Secret header upstream also accepts. */
+function presentedSecret(req) {
+  const headers = (req && req.headers) || {}
+  const auth = String(headers.authorization || headers.Authorization || '')
+  const bearer = /^Bearer\s+(.+)$/i.exec(auth)
+  if (bearer) return bearer[1].trim()
+  const direct = headers['x-management-secret'] || headers['X-Management-Secret']
+  return direct ? String(direct).trim() : ''
+}
+
+/**
+ * May this request read management data? { status: 200 } when yes, otherwise the
+ * status and the body to refuse with.
+ *
+ * Deliberately the SAME rule as the bundle's managementAuthMiddleware, including
+ * the parts that are less convenient: a disabled management API answers 404, not
+ * 200, because that is what /v0/management/accounts answers on a fresh instance
+ * (and what smoke.sh checks for, over both prefixes). Statistics that answered
+ * 200 where its sibling answers 404 would misreport the instance's state.
+ */
+function checkManagementAuth(req, opts) {
+  const cfg = managementConfig(opts)
+  if (!cfg || !cfg.enableManagementApi) {
+    return { status: 404, code: 'management_api_disabled', message: 'Management API is not enabled' }
+  }
+  const expected = String(cfg.managementApiSecret || '')
+  if (!expected) {
+    return { status: 500, code: 'management_api_misconfigured', message: 'Management API secret is not configured' }
+  }
+  const presented = presentedSecret(req)
+  if (!presented) {
+    return { status: 401, code: 'missing_authentication', message: 'Authentication required. Provide Authorization: Bearer <secret> or X-Management-Secret header' }
+  }
+  if (!timingSafeMatch(presented, expected)) {
+    return { status: 401, code: 'invalid_secret', message: 'Invalid management API secret' }
+  }
+  return { status: 200 }
 }
 
 /**

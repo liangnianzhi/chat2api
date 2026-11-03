@@ -24,6 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 跑 lint 需要 node：脚本里的 "Node syntax" 与 docs_claims.js 两段都要它，
+      # 没有 node 时前者在 set -u 下直接跳段、后者变成 SKIP，等于两个检查都不存在。
+      # 版本跟镜像一致（Dockerfile 用 node:20-alpine）。
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       # tests/lint.sh covers what used to be two hand-written steps, and more:
       #   - LF-only line endings for every text file (catches a CRLF checkout,
       #     which silently breaks the shebang of entrypoint.sh inside the image)
@@ -31,8 +39,12 @@ jobs:
       #   - bash -n on every *.sh, node --check on every *.js (no hand-kept list,
       #     so a new shim/*.js can never be silently left unchecked)
       #   - the executable bit on the entrypoints
+      # 用 bash 显式调用，不依赖文件的可执行位：仓库里的 lint.sh 是 100644，
+      # 在 CI 的全新 checkout 上 ./tests/lint.sh 会 "Permission denied"，
+      # 而脚本自己的可执行位检查只看工作区（还会回退到 git index），看不见这件事。
+      # 2026-11-03 的 main 构建（run 123）就是这样在 0 秒内失败的。
       - name: Repo lint
-        run: ./tests/lint.sh
+        run: bash tests/lint.sh
 
       - name: ShellCheck
         run: |

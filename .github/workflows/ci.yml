@@ -298,10 +298,16 @@ jobs:
       # 完整套件：自建临时容器，覆盖容器内部状态（端口、降权、时区、加密、重启）。
       - name: Run container smoke tests
         id: smoke
+        timeout-minutes: 20
         run: |
           set +e
-          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh > /tmp/smoke.log 2>&1
+          # 整套 smoke 最多 20 分钟：卡住时必须失败，不能把 job 挂到 6 小时上限。
+          # 外面套一层 timeout，是为了让"卡住"变成"有出口的失败"，而不是无限等待。
+          timeout 1500 bash tests/smoke.sh > /tmp/smoke.log 2>&1
           smoke_ec=$?
+          if [ "$smoke_ec" = 124 ]; then
+            echo '::error title=smoke::tests/smoke.sh 超过 20 分钟没有结束（timeout 124）——最后进度见下'
+          fi
           cat /tmp/smoke.log
           {
             echo '### container smoke tests'
@@ -314,7 +320,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$smoke_ec" != 0 ]; then
             # 失败行转注解：job log 读不到，注解是唯一能看到的现场。
-            grep -n -i -E 'fail|error|FAIL' /tmp/smoke.log 2>/dev/null \
+            # 先把"进行到哪一段"也抛出来，否则只看得到第一条 FAIL，不知道走到哪里。
+            echo "::error title=smoke-progress::$(grep -a -E '^(== |  PASS|  FAIL)' /tmp/smoke.log | tail -6 | tr '\n' '|' | tr -cd '[:print:] |' | cut -c1-600)"
+            grep -n -i -E '(^| )FAIL' /tmp/smoke.log 2>/dev/null \
               | tail -12 | while IFS= read -r r; do
                   echo "::error title=smoke::${r//'%'/'%25'}"
                 done || true

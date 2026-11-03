@@ -109,7 +109,25 @@ const upstreamExports = require(GATEWAY_ENTRY)
 /* The secret is never logged: /data/.chat2api/.management-secret is the */
 /* only copy, readable by the container user.                           */
 /* ------------------------------------------------------------------ */
-function enableManagementApi() {
+// Enabling this needs the store, and the store is not usable the instant the
+// bundle is required -- `getConfig()` throws 'Storage not initialized, please call
+// initialize() first' until the proxy has finished starting. Doing it once at
+// startup therefore left the management API exactly as it was: off, and every
+// /management call answering 404 (the container log said so plainly).
+//
+// So: try now, and if the store is not ready yet, try again on a timer. The routes
+// read the config per request, so a late update is as good as an early one.
+function enableManagementApi(attempt = 1) {
+  const retry = (why) => {
+    if (attempt >= 120) {
+      console.error('[supervisor] store never became ready; management API left off:', why)
+      return
+    }
+    if (attempt === 1 || attempt % 20 === 0) {
+      console.log('[supervisor] store not ready yet (' + why + '); retrying, attempt ' + attempt)
+    }
+    setTimeout(() => enableManagementApi(attempt + 1), 250).unref()
+  }
   try {
     const home = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
     // Reached through the bundle's own export graph, the same way the
@@ -122,10 +140,7 @@ function enableManagementApi() {
       globalThis.__chat2apiStore, shim.__storeManager]
     const mgr = cands.find((c) => c && typeof c.getConfig === 'function'
       && typeof c.updateConfig === 'function')
-    if (!mgr || typeof mgr.getConfig !== 'function' || typeof mgr.updateConfig !== 'function') {
-      console.warn('[supervisor] store manager not reachable; management API left at its configured value')
-      return
-    }
+    if (!mgr) return retry('no store manager in the export graph')
     const current = mgr.getConfig() || {}
     const mgmt = current.managementApi || {}
     const updates = {}
@@ -156,10 +171,14 @@ function enableManagementApi() {
     }
     mgr.updateConfig({ managementApi: { ...mgmt, ...updates } })
     console.log('[supervisor] management API enabled'
-      + (updates.managementApiSecret ? ' (secret generated; see $CHAT2API_HOME/.management-secret)' : ''))
+      + (updates.managementApiSecret ? ' (secret in $CHAT2API_HOME/.management-secret)' : '')
+      + (attempt > 1 ? ' after ' + attempt + ' attempts' : ''))
   } catch (err) {
     // Never fatal: the UI works over IPC whether or not the HTTP surface does.
-    console.error('[supervisor] failed to enable the management API:', err && err.message)
+    // 'Storage not initialized' is a timing problem, not a configuration one.
+    const msg = err && err.message ? String(err.message) : String(err)
+    if (/not initialized|initialize\(\)/i.test(msg)) return retry('store not initialized')
+    console.error('[supervisor] failed to enable the management API:', msg)
   }
 }
 enableManagementApi()

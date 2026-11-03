@@ -34,7 +34,12 @@
 #
 set -eu
 
-cd "$(dirname "$0")"
+# 先把脚本自己的路径记下来再 cd。只写 cd "$(dirname "$0")" 是不行的：
+# 那之后 $0 可能是相对路径，而 help/未知命令两处要用 sed 读自己开头的注释；
+# 一旦 cd 让它失效，`./deploy.sh --help` 就只剩一句 sed 报错。
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+SELF=$SELF_DIR/$(basename -- "$0")
+cd "$SELF_DIR"
 
 # ------------------------------------------------------------------ #
 # 基础探测：docker 可能在 PATH 里，也可能只有 /usr/local/bin/docker
@@ -717,12 +722,12 @@ case "${1:-upgrade}" in
     ;;
   verify)  do_verify_copy "${2:-}" ;;
   help|-h|--help)
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "$SELF" | sed 's/^# \{0,1\}//'
     ;;
   *)
     echo "ERROR: 未知命令 ${1}" >&2
     echo >&2
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,34p' "$SELF" | sed 's/^# \{0,1\}//' >&2
     exit 2
     ;;
 esac

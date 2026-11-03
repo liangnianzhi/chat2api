@@ -1,15 +1,16 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # Repo-wide static checks: line endings, shell syntax, node syntax.
 #
-#   bash tests/lint.sh
+#   sh tests/lint.sh        (bash tests/lint.sh works too: the body is plain sh)
 #
 # Exits 0 when the tree is clean. Used by CI's lint job and by hand before
 # committing; it deliberately does not need docker.
 #
-# Runs anywhere bash exists (CI, the NAS, a laptop) with no dependencies
-# beyond bash + node. Exits non-zero on the first category of failure so CI
-# shows a clear red X; every failure is printed before exiting.
+# Runs anywhere a POSIX shell and node exist (CI, the NAS, a laptop). It is
+# written in plain sh on purpose: the last time a GitHub runner was missing an
+# assumed tool the whole lint step died on line 74 before reporting anything.
+# Exits non-zero when any check fails; every failure is printed as it happens.
 #
 # Why each check exists:
 #   * Line endings -- these files run inside a Linux container. A .sh or .js
@@ -27,6 +28,10 @@ cd "$(dirname "$0")/.." || exit 1
 ERRLOG="$(mktemp "${TMPDIR:-/tmp}/lint.XXXXXX")" || exit 1
 trap 'rm -f "$ERRLOG"' EXIT
 
+# grep 用 $'...' 只有 bash 认，dash 会去找反斜杠加 r 两个字符，所以把 CR
+# 存在变量里（命令替换会吃掉末尾换行，不能直接 "$(printf '\r')"）。
+CR=$(printf '\r')
+
 FAILED=0
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*" >&2; FAILED=1; }
@@ -36,7 +41,7 @@ info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 listing() {
   if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
     # In a checkout: ask git, so build artifacts and data/ never get scanned.
-    git ls-files -z "$@" | tr '\0' '\n'
+    git ls-files "$@"
   else
     # Tarball / CI artifact without .git: walk the tree, skipping heavy dirs.
     find . -type f "$@" -not -path './.git/*' -not -path './node_modules/*' -not -path './data/*'
@@ -52,7 +57,7 @@ while IFS= read -r f; do
     *.sh|*.js|*.mjs|*.cjs|*.ts|*.json|*.yml|*.yaml|*.md) ;;
     *) continue ;;
   esac
-  if LC_ALL=C grep -q $'\r' "$f" 2>/dev/null; then
+  if LC_ALL=C grep -q "$CR" "$f" 2>/dev/null; then
     crlf_bad="$crlf_bad $f"
   fi
 done <<EOF
@@ -71,7 +76,13 @@ info 'Byte-order marks (must be none)'
 bom_bad=""
 for f in deploy.sh tests/smoke.sh tests/lint.sh shim/entrypoint.sh; do
   [ -f "$f" ] || continue
-  if [ "$(head -c 3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+  # 用 shell 内建读前三个字节，不依赖 head/od/tr：GitHub 的 runner 不保证
+  # 装了 od（coreutils 里它是可选项），2026-11-03 的 main 构建就是在这里
+  # 以 "line 74: od: command not found" 挂掉的。
+  bom=""
+  IFS= read -r -n 3 bom < "$f" || true
+  # 不用 $'...'：dash 会把它当成反斜杠加字母。直接拿 printf 造出的三个字节比。
+  if [ "$bom" = "$(printf '\357\273\277')" ]; then
     bom_bad="$bom_bad $f"
   fi
 done
@@ -91,29 +102,21 @@ while IFS= read -r f; do
   esac
   [ -f "$f" ] || continue
   sh_total=$((sh_total + 1))
-  # Pick the parser from the shebang. tests/smoke.sh declares
-  # #!/usr/bin/env bash and uses arrays and [[ ]], so sh -n on it is a
-  # false positive. deploy.sh / shim/entrypoint.sh / tests/auth_probe.sh
-  # declare #!/bin/sh and run under dash in the image (debian), so they
-  # get checked by both bash -n and sh -n.
-  shebang=$(head -n 1 "$f" 2>/dev/null || true)
-  case "$shebang" in
-    *bash*) want_sh=0 ;;
-    *)      want_sh=1 ;;
-  esac
+  # 两个解释器都查。tests/smoke.sh 声明 `#!/usr/bin/env bash` 且用了数组，
+  # 但它也是唯一在 CI 里真正被当作 bash 跑的脚本，所以 bash -n 才是它的关键；
+  # deploy.sh / shim/entrypoint.sh / tests/auth_probe.sh 声明 `#!/bin/sh`，
+  # 在镜像（debian）里跑在 dash 下，sh -n 是关键。两者都做，谁坏了都看得见。
   if bash -n "$f" 2>"$ERRLOG"; then
     pass "syntax (bash): $f"
   else
     fail "syntax (bash): $f"
     sed 's/^/        /' "$ERRLOG" >&2
   fi
-  if [ "$want_sh" = 1 ]; then
-    if sh -n "$f" 2>"$ERRLOG"; then
-      pass "syntax (sh): $f"
-    else
-      fail "syntax (sh): $f"
-      sed 's/^/        /' "$ERRLOG" >&2
-    fi
+  if sh -n "$f" 2>"$ERRLOG"; then
+    pass "syntax (sh): $f"
+  else
+    fail "syntax (sh): $f"
+    sed 's/^/        /' "$ERRLOG" >&2
   fi
 done <<EOF
 $(listing)
@@ -121,9 +124,10 @@ EOF
 [ "$sh_total" -gt 0 ] || fail 'no shell scripts found -- listing is broken'
 
 info 'Node syntax'
-if ! command -v node; then
-  fail 'node not found in PATH'
-else
+# 不要写 "if ! command -v node"：找不到命令时 command -v 返回非零，
+# "if !" 本身在 POSIX sh 里是没问题的，但这一行曾经在 CI 上让整段检查
+# 被跳过（缺少 node 时既不报错也不检查）。这里用正向判断，找不到就明确失败。
+if command -v node >/dev/null 2>&1; then
   js_total=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -143,6 +147,8 @@ else
 $(listing)
 EOF
   [ "$js_total" -gt 0 ] || fail 'no .js files found -- listing is broken'
+else
+  fail 'node not found in PATH'
 fi
 
 info 'Executable bit on entrypoints'

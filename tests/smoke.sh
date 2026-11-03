@@ -69,6 +69,13 @@ wait_ready() {
     if curl -fsS "${BASE}/health" >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
+  # 没就绪时必须留下现场：容器是没起来、起来就崩了、还是起来了但 /health 不答，
+  # 三者的修法完全不同，而 stdout 在 CI 上读不到（匿名看不到 job log）。
+  note "wait_ready TIMEOUT"
+  note "state: $(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER" 2>/dev/null || echo 'no container')"
+  docker logs --tail 30 "$CONTAINER" 2>&1 | tr -d '\r' | while IFS= read -r ln; do
+    note "log: $ln"
+  done
   return 1
 }
 

@@ -277,9 +277,28 @@ jobs:
       - name: Run container smoke tests
         id: smoke
         run: |
-          set -o pipefail
-          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh 2>&1 | tee /tmp/smoke.log
-
+          set +e
+          IMAGE=${{ env.IMAGE_REF }} bash tests/smoke.sh > /tmp/smoke.log 2>&1
+          smoke_ec=$?
+          cat /tmp/smoke.log
+          {
+            echo '### container smoke tests'
+            echo
+            echo "- exit: $smoke_ec"
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$smoke_ec" != 0 ]; then
+            # 失败行转注解：job log 读不到，注解是唯一能看到的现场。
+            grep -n -i -E 'fail|error|FAIL' /tmp/smoke.log 2>/dev/null \
+              | tail -12 | while IFS= read -r r; do
+                  echo "::error title=smoke::${r//'%'/'%25'}"
+                done || true
+            echo "::error title=smoke::tests/smoke.sh 退出 $smoke_ec"
+            exit 1
+          fi
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
       - name: Verify over HTTP like a real client
         run: |

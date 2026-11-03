@@ -741,16 +741,18 @@ function check(req) {
     return { allowed: true, ctx }
   }
 
-  if (!REQUIRE_AUTH) {
-    audit({ ...ctx, event: 'request', result: 'allow', reason: 'auth_disabled', class: ctx.class })
-    return { allowed: true, ctx }
-  }
-
-  // 1) Provenance.
+  // 0) Provenance —— 这一条与"要不要登录"无关，所以放在门开关之前。
+  // 关掉门是为了内网免登录，不是为了让别的网站能借用户浏览器发请求：
+  // 跨站 POST 带着 JSON 就绕开了预检，只有 Origin/Referer 能挡住它。
   const prov = checkProvenance(req)
   if (!prov.ok) {
     audit({ ...ctx, event: 'auth', result: 'deny', reason: prov.reason, detail: prov.origin || prov.referer })
     return { allowed: false, kind: 'cross_origin', status: 403, ctx, provenance: prov }
+  }
+
+  if (!REQUIRE_AUTH) {
+    audit({ ...ctx, event: 'request', result: 'allow', reason: 'auth_disabled', class: ctx.class })
+    return { allowed: true, ctx }
   }
 
   // 2) Credential.

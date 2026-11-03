@@ -2,6 +2,11 @@ name: build
 
 # push 到 main 时自动构建、测试并推送 latest。
 # PR 也会构建并测试（不推送）；workflow_dispatch 可手动重建。
+#
+# 脚本一律用解释器显式调用（sh/bash/node ...），不依赖工作区里的可执行位：
+# git 里记的 mode 和磁盘上的 mode 可以不一致（本仓库就踩过：测试脚本在
+# git 里是 100644，Windows 工作区里是 755，于是本地全绿、CI 上 exit 126）。
+# 这也是 lint 自己的"入口必须可执行"检查保留的意义：它查的是 git mode。
 
 on:
   push:
@@ -60,8 +65,7 @@ jobs:
             sh --version 2>&1 | head -1 || true
             echo '--- ./tests/lint.sh ---'
             ls -l tests/lint.sh tests/smoke.sh tests/auth_probe.sh deploy.sh shim/entrypoint.sh
-            ./tests/lint.sh 2>&1 | head -200 || true
-            echo "exit=$?"
+            bash tests/lint.sh 2>&1 | head -200 || true
             echo '--- node tests/docs_claims.js ---'
             node tests/docs_claims.js 2>&1 | tail -40 || true
             echo '```'
@@ -69,7 +73,7 @@ jobs:
           exit 0
 
       - name: Repo lint
-        run: ./tests/lint.sh
+        run: bash tests/lint.sh
 
       - name: ShellCheck
         run: |

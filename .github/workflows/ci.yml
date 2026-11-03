@@ -52,6 +52,11 @@ jobs:
       #
       # 先探两件事，失败也留痕：日志本身我这边取不到（/logs 匿名 403），
       # 只能靠 job summary。等日志可读了就把这两步删掉。
+      #
+      # 我这边取不到 job log（/actions/.../logs 匿名 403），而 lint 一失败整个
+      # job 就断了，只能看到 "Process completed with exit code 1"。所以把 lint
+      # 的完整输出写进 job summary，再单跑 docs_claims.js 看是不是它先挂的。
+      # 等日志可读了，这两步就可以删。
       - name: Probe the lint environment
         continue-on-error: true
         run: |
@@ -59,10 +64,12 @@ jobs:
             echo '### probe'
             echo '```'
             bash --version | head -1
+            sh --version 2>&1 | head -1 || true
             ls -l tests/lint.sh
-            bash -n tests/lint.sh && echo 'bash -n tests/lint.sh: OK'
             echo '--- bash tests/lint.sh ---'
-            bash tests/lint.sh 2>&1 | head -80 || true
+            bash tests/lint.sh 2>&1 | head -200 || true
+            echo '--- node tests/docs_claims.js ---'
+            node tests/docs_claims.js 2>&1 | tail -40 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0

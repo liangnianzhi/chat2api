@@ -13,8 +13,9 @@ version=1.7.16
 # 当前跟随的上游提交（核对日期当天的 main 头）
 commit=b306c19fcb9fae78a4acfa365f22167c00d6389a
 
-# 跟踪方式：branch = 跟随 main 头（会变化）；commit = 锁定到上面的提交
-tracking=branch
+# 跟踪方式：branch = 跟随 main 头（会变化）；commit = 锁定到上面的提交。
+# 实际生效的是 commit：Dockerfile 的 CHAT2API_REF 默认值就是上面的 commit。
+tracking=commit
 
 # 上次核对日期
 checked_at=2026-10-18

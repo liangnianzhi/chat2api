@@ -446,6 +446,13 @@ git push --dry-run origin HEAD:main
 只记**面向使用者**的变更；内部重构、测试与构建脚本的调整不在这里。
 1.8.1 对外只有三件事，其中只有第 3 条可能让人动手，且仅限改过 `CHAT2API_IPC_RATE_PER_MIN` 的人。
 
+## 1.8.2（未发布）
+
+- **修好了推送事故**：仓库里的源码恢复成真实内容（此前 51 个文件以 base64 单行形式提交，任何人在 GitHub 上看到的、CI 拿到的都不是可运行代码）。已逐个用 git blob sha 与构建源码树对账，50/51 字节级一致，剩下 1 个文件当时被 GitHub API 限流，稍后单独复核过：一致。
+- **CI 按分支构建**：构建参数 `CHAT2API_REF` 过去写死 `main`，在分支上触发构建会把 `main` 的上游代码打进镜像；现在取 `github.ref_name`，分支构建就是分支的代码。
+- **CI 提前失败**：构建完镜像后立刻跑两个不需要容器的套件（`tests/auth_selftest.js`、`tests/docs_claims.js`），鉴权网关卡住或文档与代码对不上时，不用等到 compose 起容器才发现。
+- **文档一致性检查修复**：`tests/docs_claims.js` 之前盯的常量名（`REPORT_BUDGET_MS`）在 `shim/health.js` 里根本不存在，这条断言等于空转；现在盯 `DEFAULT_BUDGET_MS`（`CHAT2API_HEALTH_BUDGET_MS || 1500`）。
+
 ## 1.8.1
 
 - **`/v1/**` 拒绝时改为返回 JSON**：未带密钥或用错密钥时，得到 `401 application/json` 与上游同款错误体 `{"error":{"message":"Invalid API key","type":"invalid_request_error","code":"invalid_api_key"}}`，不再返回 HTML 登录页。openai-python、openai-node、LangChain、one-api 等客户端不会再出现 `JSONDecodeError` / `Unexpected token '<'`。浏览器打开页面路径（`/`、`/__login`）仍然看到登录页。

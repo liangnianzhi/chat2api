@@ -1,0 +1,43 @@
+name: mark-executable
+
+# 一次性工作流：把入口脚本在 git 里的 mode 从 100644 改成 100755。
+# 只能在 Actions 页面手动点 Run workflow 触发（没有 push/pull_request 触发器）。
+#
+# 为什么需要它：网页编辑器、拖拽上传、内容接口都会把文件记成 644，改不了
+# mode；能改的只有 git 索引本身。而本仓库的 Windows 工作区 core.fileMode
+# 为 false，磁盘上 chmod 也不会被 git 看见，所以这件事只能在一台 Linux 上做。
+#
+# 跑完就可以删掉这个文件了。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  chmod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record 100755 for the entrypoints
+        run: |
+          set -eux
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git update-index --chmod=+x \
+            deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh
+
+          echo '--- 索引里的 mode（应为 100755）:'
+          git ls-files -s -- deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh
+
+          echo '--- 待提交的改动:'
+          git diff --cached --summary
+
+          git commit -m 'chore: mark the entrypoints executable in git' \
+                     -m 'deploy.sh, shim/entrypoint.sh and the three test scripts were recorded as 100644. A Linux checkout therefore hands out 644 files: the image exec-s the entrypoint as 126/127, and ./deploy.sh does not run on the NAS. Not one byte of any file changes here -- only the mode bits.'
+
+          # trigger 是 workflow_dispatch 时 HEAD 指向 main；detached 也一并兜住。
+          git push origin 'HEAD:main'

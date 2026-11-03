@@ -374,15 +374,49 @@ jobs:
             printf '::error title=smoke-trace::%s\n' "$(printf '%s' "$line" | tr ' ' '_' | tr -cd '[:alnum:] .:_-')"
           done
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
+      # 诊断规则和 smoke 步骤一样：job log 读不到（匿名 403），所以每条失败都必须
+      # 变成注解，否则又是「exit code 1」这一句。
       - name: Verify over HTTP like a real client
         run: |
-          docker run -d --name c2a-http -p 127.0.0.1:18083:8082 ${{ env.IMAGE_REF }} >/dev/null
+          set +e
+          docker rm -f c2a-http >/dev/null 2>&1 || true
+          # 门 pin 开：套件里四十多条 401/403/415 断言测的是凭据模型本身。
+          # 「发布默认不登录」由主 smoke 末尾的局域网阶段单独验证。
+          docker run -d --name c2a-http -p 127.0.0.1:18083:8082 \
+            -e CHAT2API_REQUIRE_AUTH=1 \
+            --log-opt max-size=10m --log-opt max-file=3 \
+            ${{ env.IMAGE_REF }} >/dev/null 2>&1
+          ok=no
           for i in $(seq 1 90); do
-            if curl -fsS http://127.0.0.1:18083/health >/dev/null 2>&1; then break; fi
+            if curl -fsS http://127.0.0.1:18083/health >/dev/null 2>&1; then ok=yes; break; fi
             sleep 2
           done
-          VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh
+          if [ "$ok" != yes ]; then
+            echo '::error title=verify::c2a-http 180 秒内没有提供 /health'
+            docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' c2a-http 2>&1 \
+              | while IFS= read -r l; do echo "::error title=verify-state::${l}"; done
+            docker logs --tail 20 c2a-http 2>&1 \
+              | while IFS= read -r l; do echo "::error title=verify-log::${l//'%'/'%25'}"; done
+            exit 1
+          fi
+          VERIFY_URL=http://127.0.0.1:18083 bash tests/smoke.sh > /tmp/verify.log 2>&1
+          verify_ec=$?
+          cat /tmp/verify.log
+          {
+            echo '### verify over HTTP'
+            echo
+            echo "- exit: $verify_ec"
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/verify.log | tail -120
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           docker rm -f c2a-http >/dev/null 2>&1 || true
+          if [ "$verify_ec" != 0 ]; then
+            grep -n -E 'FAIL|❌' /tmp/verify.log 2>/dev/null | tail -12 \
+              | while IFS= read -r r; do echo "::error title=verify-fail::${r//'%'/'%25'}"; done || true
+            exit 1
+          fi
 
       - name: Publish smoke output on failure
         if: failure()

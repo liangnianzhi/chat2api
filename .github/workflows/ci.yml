@@ -53,10 +53,19 @@ jobs:
       # 先探两件事，失败也留痕：日志本身我这边取不到（/logs 匿名 403），
       # 只能靠 job summary。等日志可读了就把这两步删掉。
       - name: Probe the lint environment
+        continue-on-error: true
         run: |
-          bash --version | head -1
-          cd "$GITHUB_WORKSPACE" && ls -l tests/lint.sh && head -1 tests/lint.sh | od -c | head -2
-          bash -n tests/lint.sh && echo 'bash -n tests/lint.sh: OK'
+          {
+            echo '### probe'
+            echo '```'
+            bash --version | head -1
+            ls -l tests/lint.sh
+            bash -n tests/lint.sh && echo 'bash -n tests/lint.sh: OK'
+            echo '--- bash tests/lint.sh ---'
+            bash tests/lint.sh 2>&1 | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       - name: Repo lint
         run: bash tests/lint.sh

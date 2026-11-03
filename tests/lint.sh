@@ -1,16 +1,17 @@
-#!/bin/sh
+#!/usr/bin/env bash
 #
 # Repo-wide static checks: line endings, shell syntax, node syntax.
 #
-#   sh tests/lint.sh        (bash tests/lint.sh works too: the body is plain sh)
+#   ./tests/lint.sh         (or: bash tests/lint.sh)
 #
 # Exits 0 when the tree is clean. Used by CI's lint job and by hand before
 # committing; it deliberately does not need docker.
 #
-# Runs anywhere a POSIX shell and node exist (CI, the NAS, a laptop). It is
-# written in plain sh on purpose: the last time a GitHub runner was missing an
-# assumed tool the whole lint step died on line 74 before reporting anything.
-# Exits non-zero when any check fails; every failure is printed as it happens.
+# Needs bash and node, and nothing else. That sentence used to be a quiet lie:
+# the BOM check piped through od, which a GitHub runner does not install, and
+# the whole lint step died on that line before it could report anything. Every
+# external command here is now coreutils-or-shell, and the script is written in
+# plain sh where it costs nothing, so dash can run it too.
 #
 # Why each check exists:
 #   * Line endings -- these files run inside a Linux container. A .sh or .js

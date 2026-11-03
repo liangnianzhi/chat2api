@@ -25,7 +25,10 @@ ARG NODE_VERSION=20-alpine
 FROM node:${NODE_VERSION} AS builder
 
 ARG CHAT2API_REPO=wxs0625/Chat2API-WXS
-ARG CHAT2API_REF=main
+# 锁定的上游提交，取自 UPSTREAM.lock。写死提交而不是 main：上游随时会前进，
+# 而我们的适配层只对 UPSTREAM.md 里列的那 10 处结构做过核对，main 一动就可能
+# 在别人不知情的情况下被编进镜像。要升级上游，改这里并同步 UPSTREAM.lock/UPSTREAM.md。
+ARG CHAT2API_REF=b306c19fcb9fae78a4acfa365f22167c00d6389a
 
 RUN apk add --no-cache curl
 

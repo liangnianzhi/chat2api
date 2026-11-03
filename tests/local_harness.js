@@ -94,7 +94,15 @@ process.env.CHAT2API_HOME = DATA
 process.env.CHAT2API_SECRET_FILE = SECRET_FILE
 process.env.CHAT2API_ENABLE_WEBUI = 'true'
 
-const extras = (arg('env', '') || '').split(',').filter(Boolean)
+// --env may be repeated: `--env A=1 --env B=2` and `--env A=1,B=2` both work.
+// It used to take a single value, so a second flag was silently dropped -- which
+// is indistinguishable from "that setting had no effect" when a test fails.
+const extras = process.argv.reduce((acc, cur, i) => {
+  if (cur === '--env' && typeof process.argv[i + 1] === 'string') {
+    acc.push(...process.argv[i + 1].split(','))
+  }
+  return acc
+}, []).filter(Boolean)
 for (const extra of extras) {
   const eq = extra.indexOf('=')
   if (eq > 0) process.env[extra.slice(0, eq)] = extra.slice(eq + 1)

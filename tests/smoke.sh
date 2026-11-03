@@ -83,17 +83,27 @@ mark() { note "MARK $*"; }
 
 # docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
 # 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。
+# 这里要防的是「子进程把父 shell 的 stdout 攥住」：docker exec 的会话若挂住，
+# 命令替换就永远等不到 EOF，外层 timeout 再怎么管也管不到这一步（#182 卡了 20
+# 分钟，墓碑停在 secret-read 就是它）。所以：
+#   * 显式 </dev/null —— 谁都别去抢 stdin；
+#   * 输出先落文件，再读文件 —— 命令替换只连着一个真正的文件，不连着 docker。
+# 退出码照旧返回，调用方那套 `|| echo` 也不受影响。
 in_container() {
   # 只记调用形状，不记内容：凭据类命令会把 secret 写进参数里。
   case "$1" in
     *management-secret*) mark "in_container: <secret-read>" ;;
     *) mark "in_container: $(printf '%s' "$1" | cut -c1-40 | tr -cd '[:alnum:] :/._-')" ;;
   esac
-  timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1 || {
-    ec=$?
-    [ "$ec" = 124 ] && mark "in_container TIMEOUT"
-    return "$ec"
-  }
+  EXEC_OUT="$(mktemp)"
+  timeout 20 docker exec "$CONTAINER" sh -c "$1" </dev/null >"$EXEC_OUT" 2>&1
+  ec=$?
+  if [ "$ec" = 124 ]; then
+    mark "in_container TIMEOUT"
+  fi
+  cat "$EXEC_OUT"
+  rm -f "$EXEC_OUT"
+  return "$ec"
 }
 
 # --- access control -------------------------------------------------------

@@ -48,14 +48,17 @@ trap cleanup EXIT
 BASE="http://127.0.0.1:${PORT}"
 
 start_container() {
+  mark start_container
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$CONTAINER" \
     -p "127.0.0.1:${PORT}:8082" \
     -v "$WORKDIR/data:/data" \
     "$IMAGE" >/dev/null
+  mark start_container_done
 }
 
 wait_ready() {
+  mark wait_ready
   for _ in $(seq 1 60); do
     if curl -fsS "${BASE}/health" >/dev/null 2>&1; then return 0; fi
     sleep 2
@@ -80,7 +83,10 @@ mark() { note "MARK $*"; }
 
 # docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
 # 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。
-in_container() { timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1 || echo "in_container: timeout/非零退出" >&2; }
+in_container() {
+  mark "in_container: $(printf '%s' "$1" | cut -c1-40)" | tr -cd '[:alnum:] :/._-'
+  timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1
+}
 
 # --- access control -------------------------------------------------------
 # Nothing but /health and the login page answers without a credential, so every

@@ -104,12 +104,13 @@ COPY webui/server.js /build/stage/webui/server.js
 COPY webui/auth.js /build/stage/webui/auth.js
 COPY webui/preload-bridge.js /build/stage/webui/preload-bridge.js
 COPY webui/login.html /build/stage/webui/login.html
-# 访问控制探针：在运行中的容器里可直接跑
+# 容器里能跑的探针：不用重建镜像，docker exec 直接跑。
 #   docker exec chat2api sh /app/tests/auth_probe.sh
-COPY tests/auth_probe.sh /build/stage/tests/auth_probe.sh
-# 可观测性探针：不用构建镜像也能在运行中的容器里验证安装结果
 #   docker exec chat2api sh /app/tests/observability_smoke.sh
-COPY tests/observability_smoke.sh /build/stage/tests/observability_smoke.sh
+# 用 COPY --chmod 而不是先 COPY 再 chmod：git 里这些脚本的 mode 由仓库
+# 之外的东西决定（见 tests/lint.sh 的可执行位检查），镜像不该跟着它抖动。
+COPY --chmod=755 tests/auth_probe.sh /build/stage/tests/auth_probe.sh
+COPY --chmod=755 tests/observability_smoke.sh /build/stage/tests/observability_smoke.sh
 
 RUN set -eux; \
     mkdir -p /build/stage/upstream; \

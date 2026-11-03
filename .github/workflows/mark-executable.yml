@@ -13,7 +13,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # 推 mode 改动
+  actions: write    # gh workflow run 派发 build
 
 jobs:
   chmod:

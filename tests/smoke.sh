@@ -103,10 +103,12 @@ in_container() {
     *) mark "in_container: $(printf '%s' "$1" | cut -c1-40 | tr -cd '[:alnum:] :/._-')" ;;
   esac
   EXEC_OUT="$(mktemp)"
-  # -k 2：SIGTERM 不理就 2 秒后 SIGKILL。只用 timeout 时，docker 客户端卡在
-  # 不可中断等待里可能无视 SIGTERM，那样连"超时"都不会发生。
-  timeout -k 2 20 docker exec "$CONTAINER" sh -c "$1" </dev/null >"$EXEC_OUT" 2>&1
+  mark "IC mktemp ok"
+  # 每一步都留痕：卡住时最后一条 mark 就是答案，不用再靠推理。
+  # -k 5：SIGTERM 不理就 5 秒后 SIGKILL。
+  timeout -k 5 20 docker exec "$CONTAINER" sh -c "$1" </dev/null >"$EXEC_OUT" 2>&1
   ec=$?
+  mark "IC exec ec=$ec"
   if [ "$ec" = 124 ]; then
     mark "in_container TIMEOUT"
   fi
@@ -121,11 +123,24 @@ in_container() {
 # secret as a Bearer token; a browser trades the login page for a session
 # cookie, and its state is kept in a jar.
 SECRET_FILE="/data/.chat2api/.management-secret"
+# 同一份文件在宿主机上的路径（容器把 $WORKDIR/data 挂到 /data）。
+HOST_SECRET="$WORKDIR/data/.chat2api/.management-secret"
 SECRET="${CHAT2API_MANAGEMENT_SECRET:-}"
 COOKIE_JAR="$WORKDIR/cookies.txt"
 : > "$COOKIE_JAR"
 AUTH=()
 JSON='Content-Type: application/json'
+
+# 密钥文件在宿主机上也有一份（容器把 $WORKDIR/data 挂到 /data）。以 root 读它，
+# 就完全不需要 docker exec —— #182/#183/#185 都是死在 exec 上。
+read_host_secret() {
+  [ -n "${HOST_SECRET:-}" ] || return 0
+  if [ -r "$HOST_SECRET" ]; then
+    tr -d '\r\n' < "$HOST_SECRET"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -n cat "$HOST_SECRET" 2>/dev/null | tr -d '\r\n'
+  fi
+}
 
 load_secret() {
   [ -n "$SECRET" ] && return 0
@@ -137,10 +152,10 @@ load_secret() {
     # 容器把 $WORKDIR/data 挂到 /data，所以密钥在宿主机上就是一份普通文件。
     # 先读它：不走 docker exec，这条路根本不会被 exec 会话挂住（#182/#183 就是
     # 死在 exec 上，20 分钟一动不动）。读不到才回退到 exec。
-    HOST_SECRET="$WORKDIR/data/.chat2api/.management-secret"
-    if [ -r "$HOST_SECRET" ]; then
-      SECRET="$(tr -d '\r\n' < "$HOST_SECRET")"
-    else
+    mark "secret: host read"
+    SECRET="$(read_host_secret)"
+    if [ -z "$SECRET" ]; then
+      mark "secret: exec fallback"
       SECRET="$(in_container "cat $SECRET_FILE" 2>/dev/null | tr -d '\r\n')"
     fi
   fi
@@ -420,12 +435,12 @@ if [ -z "$VERIFY_URL" ]; then
 
   info "主进程已降权"
   SECRET_FILE="/data/.chat2api/.management-secret"
-  RUNTIME_OWNER="$(in_container "stat -c '%u' $SECRET_FILE" | tr -d '\r\n')"
+  RUNTIME_OWNER="$(stat -c '%u' "$HOST_SECRET" 2>/dev/null | tr -d '\r\n')"
   [ "$RUNTIME_OWNER" = "1000" ] \
     && pass "运行时文件属主为 1000" || fail "运行时文件属主为 $RUNTIME_OWNER，预期 1000"
 
   info "上游 wasm 依赖（DeepSeek/GLM 签名）"
-  WASM_OUT="$(docker exec "$CONTAINER" node -e '
+  WASM_OUT="$(timeout -k 5 30 docker exec "$CONTAINER" node -e '
 require("/app/shim/electron-shim.js");
 const fs = require("fs"), path = require("path");
 const p = process.resourcesPath;
@@ -468,11 +483,11 @@ console.log("ok");
   fi
 
   info "生成的密钥"
-  ON_DISK="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
+  ON_DISK="$(read_host_secret)"
   [ -n "$ON_DISK" ] && pass "密钥已生成" || fail "未找到生成的密钥文件"
   [ "$ON_DISK" = "$SECRET" ] && pass "容器内的密钥就是我们用来鉴权的那一个" \
     || fail "容器密钥与用于鉴权的值不一致（请用 SECRET 显式指定）"
-  MODE="$(in_container "stat -c '%a' $SECRET_FILE" | tr -d '\r\n')"
+  MODE="$(stat -c '%a' "$HOST_SECRET" 2>/dev/null | tr -d '\r\n')"
   [ "$MODE" = 600 ] && pass "密钥文件权限为 600" || fail "密钥文件权限为 $MODE，预期 600"
 
   info "账号写入与读取"
@@ -491,7 +506,7 @@ console.log("ok");
   grep -q 'sk-mgmt-' <<<"$KEYRESP" && pass "生成客户端 API 密钥" || fail "生成密钥失败: $KEYRESP"
 
   info "凭证加密（AES-256-GCM）"
-  CRYPTO_OUT="$(docker exec "$CONTAINER" node -e '
+  CRYPTO_OUT="$(timeout -k 5 30 docker exec "$CONTAINER" node -e '
 const s = require("/app/shim/electron-shim.js");
 const secret = "roundtrip-probe-value";
 if (s.safeStorage.isEncryptionAvailable() !== true) { console.error("not available"); process.exit(1) }
@@ -506,10 +521,10 @@ console.log("ok");
 ' 2>&1)"
   grep -q '^ok$' <<<"$CRYPTO_OUT" && pass "加解密往返、无明文泄露、篡改可检测" || fail "凭证加密自检失败：$CRYPTO_OUT"
 
-  docker exec "$CONTAINER" test -f /data/.chat2api/.safe-storage-key \
+  timeout -k 5 20 docker exec "$CONTAINER" test -f /data/.chat2api/.safe-storage-key \
     && pass "加密密钥持久化在数据卷" || fail "加密密钥未落在数据卷"
 
-  DATAJSON_OUT="$(docker exec "$CONTAINER" node -e '
+  DATAJSON_OUT="$(timeout -k 5 30 docker exec "$CONTAINER" node -e '
 const fs = require("fs");
 try { JSON.parse(fs.readFileSync("/data/.chat2api/data.json", "utf8")); process.exit(1) }
 catch { process.exit(0) }
@@ -525,7 +540,7 @@ catch { process.exit(0) }
   grep -q 'smoke-account' <<<"$AFTER" && pass "重启后账号仍在" || fail "重启后账号丢失"
 
   [ -n "$SECRET" ] && pass "重启后管理密钥不变（同一 Bearer 仍然可用）" || fail "重启后管理密钥丢失"
-  RESTART_OWN="$(in_container "cat $SECRET_FILE" | tr -d '\r\n')"
+  RESTART_OWN="$(read_host_secret)"
   [ -n "$RESTART_OWN" ] && pass "重启后密钥文件仍在数据卷" || fail "重启后密钥文件丢失"
 
   RESTART_HEALTH="$(curl -fsS "${BASE}/health" 2>/dev/null || echo '')"

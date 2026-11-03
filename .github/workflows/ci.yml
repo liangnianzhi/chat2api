@@ -303,6 +303,8 @@ jobs:
           set +e
           # 整套 smoke 最多 20 分钟：卡住时必须失败，不能把 job 挂到 6 小时上限。
           # 外面套一层 timeout，是为了让"卡住"变成"有出口的失败"，而不是无限等待。
+          export C2A_SMOKE_PROGRESS="$RUNNER_TEMP/smoke.progress"
+          : > "$C2A_SMOKE_PROGRESS"
           timeout 1500 bash tests/smoke.sh > /tmp/smoke.log 2>&1
           smoke_ec=$?
           if [ "$smoke_ec" = 124 ]; then
@@ -315,7 +317,7 @@ jobs:
             echo "- exit: $smoke_ec"
             echo
             echo '```'
-            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -200
+            sed 's/\x1b\[[0-9;]*m//g' /tmp/smoke.log | tail -120
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$smoke_ec" != 0 ]; then
@@ -328,6 +330,23 @@ jobs:
                 done || true
             echo "::error title=smoke::tests/smoke.sh 退出 $smoke_ec"
             exit 1
+          fi
+
+      # 这一步总是执行（哪怕上面被 timeout 杀掉）：把 smoke 留下的进度文件回显出来。
+      # stdout 会随进程被杀一起丢掉，这个文件不会——它就是墓碑。
+      - name: Show smoke progress
+        if: always()
+        run: |
+          PF="$RUNNER_TEMP/smoke.progress"
+          if [ -s "$PF" ]; then
+            echo '### smoke progress (last phase reached)'
+            echo
+            echo '```'
+            tail -20 "$PF"
+            echo '```'
+            echo "::error title=smoke-last-phase::$(tail -3 "$PF" | tr '\n' '|' | tr -cd '[:print:] |' | cut -c1-500)"
+          else
+            echo 'smoke 没有写过进度文件（可能根本没启动）'
           fi
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
       - name: Verify over HTTP like a real client

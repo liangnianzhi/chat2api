@@ -50,16 +50,25 @@ jobs:
       # GITHUB_TOKEN 推的提交不会自动触发别的 workflow（防递归），
       # 但 workflow_dispatch 是官方明说的例外，所以这里直接把构建打起来，
       # 省掉"再点一次 build"。失败也不影响 mode 已经改好这件事。
+      # 这一轮的目标是「把 CI 的真实失败原因挖出来」：
+      # compose 起不来（/health 180s 无应答），而 job log 匿名读不到。
+      # 让 CI 的容器启动日志以注解形式出现：注解 ∈ check-run ∈ 匿名可读。
       - name: Run the CI now
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 派发 ci.yml 的 workflow_dispatch run，并等它结束，这样 curl 一个链接
-          # 就能看到结果。GITHUB_TOKEN 推的提交不会触发别的 workflow（防递归），
-          # 但 workflow_dispatch 是官方明说的例外，所以这一步能真的把 CI 排上队。
           gh workflow run ci.yml --ref main
           sleep 8
           run_id=$(gh run list --workflow ci.yml --limit 1 --json databaseId -q '.[0].databaseId')
           echo "run_id=$run_id"
           gh run watch "$run_id" --exit-status || true
+
+          # 看完之后，把被排查的容器的启动日志摘出来，转成注解。
+          repo="$GITHUB_REPOSITORY"
+          sha=$(gh run view "$run_id" --json headSha -q .headSha)
+          ids=$(gh api "repos/$repo/commits/$sha/check-runs" \
+                -q '.check_runs[] | select(.conclusion=="failure") | .id')
+          for id in $ids; do
+            gh api "repos/$repo/check-runs/$id/annotations" -q '.[].message' || true
+          done

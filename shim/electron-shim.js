@@ -122,6 +122,8 @@ const INTERCEPT_PORTS = new Set(
 
 let httpHandler = null
 let httpListening = false
+/* Set by the self-heal layer: (req, res) => boolean (true = request handled). */
+let selfhealTapHandler = null
 
 function portFromArgs(args) {
   const first = args[0]
@@ -145,6 +147,22 @@ function installHttpCapture() {
     for (const listener of requestListeners) server.removeListener('request', listener)
 
     httpHandler = function capturedHandler(req, res) {
+      // Self-heal gets the request FIRST, before koa parses it. The koa app we
+      // cannot patch is the module-level singleton
+      //
+      //   const proxyServer = new ProxyServer()   // runs when the chunk loads,
+      //                                          // long before any patch lands
+      //
+      // so this captured callback - which we own and which every dispatched
+      // request goes through - is the only seam that covers it. A guard that
+      // ever throws is bypassed: the request must not change because of us.
+      if (selfhealTapHandler) {
+        try {
+          if (selfhealTapHandler(req, res)) return
+        } catch (err) {
+          console.warn('[selfheal] request seam error:', err && err.message)
+        }
+      }
       for (const listener of requestListeners) listener.call(server, req, res)
     }
     httpListening = true
@@ -506,6 +524,104 @@ function installLoginOverride() {
 
 installLoginOverride()
 
+/* ------------------------------------------------------------------ *
+ * Account self-healing (health checks, cooldown, token-cache refresh)
+ *
+ * Installed after the exports object is built (see installSelfHeal() at the
+ * bottom of this file) so the self-heal layer can read upstream's own module
+ * exports through __upstreamExports. Everything is best effort: a failure here
+ * must never stop the proxy from serving.
+ * ------------------------------------------------------------------ */
+let selfhealModule = null
+let upstreamExports = null
+
+function loadSelfHealModule() {
+  if (selfhealModule !== null) return selfhealModule
+  try {
+    const mod = require('./selfheal.js')
+    selfhealModule = mod && typeof mod === 'object' ? mod : false
+  } catch (err) {
+    console.warn('[selfheal] module unavailable:', err && err.message)
+    selfhealModule = false
+  }
+  return selfhealModule
+}
+
+/**
+ * Find the upstream export graph for the self-heal layer.
+ *
+ * NOT headless.js: that file starts the app as a side effect of being required
+ * (`void main()`) and exports nothing, so requiring it a second time from the
+ * shim re-runs the whole bootstrap (store init, proxy server) in the same
+ * process and the second run fails with "Cannot read properties of undefined
+ * (reading 'initialize')" because the electron module hook has already been
+ * unwired by then. The classes the self-heal layer needs (AccountManager,
+ * ProxyServer, LoadBalancer, the provider adapters) live in the Rollup chunk
+ * chunks/server-*.js, which is plain, side-effect-free CJS.
+ */
+function loadUpstreamExports() {
+  if (upstreamExports !== null) return upstreamExports
+  const explicit = process.env.CHAT2API_UPSTREAM_ENTRY
+  const chunksDir = process.env.CHAT2API_UPSTREAM_CHUNKS ||
+    path.join(__dirname, '..', 'upstream', 'main', 'chunks')
+  const candidates = []
+  if (explicit) candidates.push(explicit)
+  try {
+    for (const name of fs.readdirSync(chunksDir)) {
+      if (/^server-.*[.]js$/.test(name)) candidates.push(path.join(chunksDir, name))
+    }
+  } catch (err) {
+    console.warn('[selfheal] cannot read upstream chunks dir', chunksDir + ':', err && err.message)
+  }
+  for (const entry of candidates) {
+    try {
+      const mod = require(entry)
+      if (mod && typeof mod === 'object' && mod.AccountManager) {
+        upstreamExports = mod
+        console.log('[selfheal] upstream graph loaded from', path.basename(entry))
+        return upstreamExports
+      }
+    } catch (err) {
+      console.warn('[selfheal] could not load upstream graph from', path.basename(entry) + ':', err && err.message)
+    }
+  }
+  console.warn('[selfheal] no upstream export graph found, self-heal runs in degraded mode')
+  return upstreamExports
+}
+
+function installSelfHeal() {
+  try {
+    const mod = loadSelfHealModule()
+    if (!mod || typeof mod.install !== 'function') return null
+    let config = null
+    try {
+      config = typeof mod.resolveConfig === 'function' ? mod.resolveConfig(process.env) : null
+    } catch (err) {
+      console.warn('[selfheal] config resolution failed:', err && err.message)
+    }
+    if (config && config.enabled === false) {
+      mod.install({ graph: null, config })
+      return mod.get ? mod.get() : null
+    }
+    const graph = loadUpstreamExports()
+    const instance = mod.install({ graph: graph || undefined, config: config || undefined })
+    if (typeof mod.start === 'function') mod.start()
+    const stop = () => {
+      try {
+        if (typeof mod.stop === 'function') mod.stop()
+      } catch (err) {
+        console.warn('[selfheal] stop failed:', err && err.message)
+      }
+    }
+    process.once('SIGTERM', stop)
+    process.once('SIGINT', stop)
+    return instance
+  } catch (err) {
+    console.warn('[selfheal] install failed:', err && err.message)
+    return null
+  }
+}
+
 module.exports = {
   app,
   safeStorage,
@@ -528,6 +644,44 @@ module.exports = {
   __eventBus: eventBus,
   __windowStub: windowStub,
   __replayPendingOpens: replayPendingOpens,
+  __upstreamExports: () => loadUpstreamExports(),
+  selfheal: () => loadSelfHealModule() || null,
   __httpHandler: () => httpHandler,
   __httpListening: () => httpListening,
+  // Observability installs its statistics hook through these two. They are an
+  // explicit seam on purpose: the shim owns the handler, the observability
+  // layer owns what /management/statistics answers.
+  __setSelfhealTap: (next) => {
+    selfhealTapHandler = typeof next === 'function' ? next : null
+    return selfhealTapHandler
+  },
+  __setHttpHandler: (next) => {
+    if (typeof next === 'function') httpHandler = next
+    return httpHandler
+  },
+  __installStatisticsHook: () => {
+    try {
+      // Lazy require: the shim must stay loadable on its own (tests require
+      // this file directly, and the observability directory may be absent in
+      // a trimmed build).
+      return require('./observability/install.js').install({ shim: module.exports })
+    } catch (err) {
+      console.error('[observability] install via shim failed:', err && err.message)
+      return null
+    }
+  },
 }
+
+// Self-heal installs at SHIM LOAD TIME, not when the bundle is required.
+//
+// Why the ordering matters: the headless entry is a script
+// (require('.../headless.js') -> main() -> new ProxyServer()), so by the time
+// gateway.js gets the bundle's exports the koa app has ALREADY been built from
+// the namespace's ProxyServer and its callback handed to http.Server. Patching
+// the namespace afterwards replaces a binding nobody will read again - the
+// mixed log order '[headless] proxy serving via the captured handler' before
+// '[selfheal] request path hooked via ProxyServer' proved exactly that.
+//
+// Installing here is safe: loadUpstreamExports() only require()s the Rollup
+// chunk (plain CJS, no side effects), never the headless entry.
+installSelfHeal()

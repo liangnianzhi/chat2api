@@ -16,7 +16,7 @@ permissions:
 
 env:
   IMAGE_REF: ghcr.nju.edu.cn/${{ github.repository }}:latest
-  CHAT2API_REF: main
+  CHAT2API_REF: ${{ github.ref_name }}
 
 jobs:
   lint:
@@ -24,20 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Shell syntax check
-        run: |
-          bash -n tests/smoke.sh
-          sh -n deploy.sh
-          sh -n shim/entrypoint.sh
-          echo 'shell syntax OK'
-
-      - name: Node syntax check
-        run: |
-          node --check webui/server.js
-          node --check webui/preload-bridge.js
-          node --check shim/electron-shim.js
-          node --check shim/gateway.js
-          echo 'node syntax OK'
+      # tests/lint.sh covers what used to be two hand-written steps, and more:
+      #   - LF-only line endings for every text file (catches a CRLF checkout,
+      #     which silently breaks the shebang of entrypoint.sh inside the image)
+      #   - no UTF-8 BOM on scripts
+      #   - bash -n on every *.sh, node --check on every *.js (no hand-kept list,
+      #     so a new shim/*.js can never be silently left unchecked)
+      #   - the executable bit on the entrypoints
+      - name: Repo lint
+        run: ./tests/lint.sh
 
       - name: ShellCheck
         run: |
@@ -53,17 +48,23 @@ jobs:
 
       # 上游版本对比：把「本次实际用到的上游版本」与 UPSTREAM.lock 记录的基线
       # 对比，写进 job summary。上游更新不等于一定出错，但需要人知道。
+      #
+      # 这一段不参与构建成败：它查询的是别人的仓库，限流、超时、网络抖动都会发生，
+      # 而这些都不是本仓库的问题。查询失败只写一行提示，构建继续。
       - name: Compare upstream version against the baseline
         id: upstream
+        continue-on-error: true
         run: |
           up_repo="$(sed -n 's/^repo=//p' UPSTREAM.lock)"
           base_ver="$(sed -n 's/^version=//p' UPSTREAM.lock)"
           base_sha="$(sed -n 's/^commit=//p' UPSTREAM.lock)"
 
           head_sha="$(curl -fsS "https://api.github.com/repos/${up_repo}/commits/main" \
-            -H 'Accept: application/vnd.github+json' | grep -oE '"sha": *"[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}')"
+            -H 'Accept: application/vnd.github+json' | grep -oE '"sha": *"[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}')" || true
           head_ver="$(curl -fsS "https://raw.githubusercontent.com/${up_repo}/main/package.json" \
-            | grep -oE '"version": *"[^"]+"' | head -1 | sed 's/.*"version": *"//;s/"//')"
+            | grep -oE '"version": *"[^"]+"' | head -1 | sed 's/.*"version": *"//;s/"//')" || true
+          head_sha="${head_sha:-unknown}"
+          head_ver="${head_ver:-unknown}"
 
           echo "baseline: ${base_ver} (${base_sha})"
           echo "upstream: ${head_ver} (${head_sha})"
@@ -76,7 +77,9 @@ jobs:
             echo "| baseline (UPSTREAM.lock) | \`${base_ver}\` | \`${base_sha}\` |"
             echo "| upstream main now | \`${head_ver}\` | \`${head_sha}\` |"
             echo
-            if [ "$head_sha" != "$base_sha" ]; then
+            if [ "$head_sha" = "unknown" ]; then
+              echo '上游版本查询失败（限流或网络问题），本次跳过对比；构建不受影响。'
+            elif [ "$head_sha" != "$base_sha" ]; then
               echo "**上游有更新。** 与基线相比的改动："
               echo
               echo "https://github.com/${up_repo}/compare/${base_sha}...${head_sha}"
@@ -115,6 +118,13 @@ jobs:
             cat /tmp/upstream_info.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 不碰 docker 的本地套件：鉴权自检（自建 harness，真实 HTTP）与文档一致
+      # 性检查。它们只需要 node >= 18，先跑，失败时不用等到 compose 起容器。
+      - name: Auth selftest and documentation claims
+        run: |
+          node tests/auth_selftest.js
+          node tests/docs_claims.js
 
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'

@@ -37,8 +37,16 @@ LABEL org.opencontainers.image.title="Chat2API" \
       org.opencontainers.image.source="https://github.com/liangnianzhi/chat2api" \
       org.opencontainers.image.licenses="GPL-3.0"
 
-# curl 供健康检查使用；tini 回收子进程并转发信号，保证优雅退出。
-RUN apk add --no-cache curl tini tzdata
+# curl 供健康检查使用；tini 回收子进程并转发信号，保证优雅退出；
+# su-exec 用于启动时修正 /data 属主后降到 node 运行（与主 Dockerfile 一致）。
+RUN apk add --no-cache curl tini tzdata su-exec
+# 与主 Dockerfile 同样的瘦身：运行时用不到 npm / yarn / C++ 头文件。
+RUN set -eux; \
+    rm -rf /usr/local/lib/node_modules \
+           /usr/local/include/node \
+           /opt/yarn-v1.22.22 \
+           /root/.cache \
+           /var/cache/apk/*
 
 # node 官方镜像已有 uid/gid 1000（node），复用它以免 addgroup -g 1000 冲突。
 # Alpine 无 usermod，用 awk 改 /etc/passwd 第 6、7 字段并校验仍为 7 段。
@@ -70,9 +78,26 @@ RUN set -eux; \
     \
     echo "--- 运行目录: $(du -sh /app | cut -f1), node_modules $(du -sh /app/node_modules | cut -f1)"; \
     \
-    mkdir -p /data/.chat2api; \
+    mkdir -p /data/.chat2api /app/shim /app/webui; \
     chown -R node:node /data /app; \
     echo 'layout ready'
+
+# 仓库里的 shim/webui 是权威副本：.tgz 可能是旧快照，缺了新增文件就会启动失败
+# （shim/health.js 供 /health 使用，webui/auth.js 供访问控制使用）。
+# 必须放在解包之后，否则会被 tar 覆盖。
+COPY shim/health.js /app/shim/health.js
+COPY shim/entrypoint.sh /app/shim/entrypoint.sh
+COPY webui/auth.js /app/webui/auth.js
+
+RUN set -eux; \
+    test -f /app/shim/health.js; \
+    test -f /app/webui/auth.js; \
+    test -f /app/shim/entrypoint.sh; \
+    chmod +x /app/shim/entrypoint.sh; \
+    chown -R node:node /app; \
+    node -e "const e=require('/app/node_modules/electron'); \
+             if(!e.__isShim){console.error('electron 未指向 shim');process.exit(1)}"; \
+    echo "offline layout ready"
 
 ENV NODE_ENV=production \
     HOME=/data \
@@ -88,10 +113,11 @@ ENV NODE_ENV=production \
 VOLUME ["/data"]
 EXPOSE 8082
 
-USER node
+# 容器以 root 起，由 entrypoint 修正 /data 属主后 exec su-exec node（与主镜像一致）。
+# 多阶段交付物里用户自己 chown 的数据卷经常属主不对，降权点必须在挂载之后。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" >/dev/null \
+        || { curl -sS "http://127.0.0.1:${CHAT2API_PORT}/health" | cut -c1-500; exit 1; }
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
-
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/sbin/tini", "--", "/app/shim/entrypoint.sh"]
 CMD ["node", "/app/shim/gateway.js"]

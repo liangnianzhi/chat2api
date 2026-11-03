@@ -52,6 +52,7 @@ const { CATEGORIES } = require('./failure-classify')
 const catalog = require('./catalog')
 const requestLog = require('./request-log')
 const stats = require('./stats')
+const { timingSafeEqual } = require('crypto')
 
 /** Log prefix; smoke.sh greps for this shape, keep it stable. */
 const TAG = '[observability]'
@@ -464,6 +465,7 @@ const STATS_PATHS = new Set([
 ])
 
 /** Answer /management/statistics from our aggregates; true when handled. */
+/** Answer /management/statistics from our aggregates; true when handled. */
 function answerStatistics(req, res, opts) {
   if (!req || !res) return false
   const method = String(req.method || 'GET').toUpperCase()
@@ -476,21 +478,106 @@ function answerStatistics(req, res, opts) {
     return false
   }
   if (!STATS_PATHS.has(pathname)) return false
-  const payload = statisticsPayload(opts)
+  // This hook sits IN FRONT of upstream's handler, so upstream's own auth never
+  // runs for a request we answer: answering without a check would publish the
+  // management surface to anyone who can reach the port. Upstream guards these
+  // routes with the same Bearer secret a client uses (and treats "no secret
+  // generated yet" as open, because it creates one on first use), so this check
+  // follows the same rule - no stricter, or a healthy deployment would fail our
+  // own smoke test while the real endpoint would have answered it.
+  const guard = checkManagementAuth(req, opts)
+  if (guard.status !== 200) {
+    return replyJson(res, method, guard.status, {
+      success: false,
+      error: { code: guard.code, message: guard.message },
+    }, { 'WWW-Authenticate': 'Bearer realm="chat2api-management"' })
+  }
+  return replyJson(res, method, 200, statisticsPayload(opts), {
+    'X-C2A-Observability': 'statistics',
+  })
+}
+
+/** Write one JSON reply; false when the response is already unusable. */
+function replyJson(res, method, status, payload, extraHeaders) {
   const body = Buffer.from(JSON.stringify(payload), 'utf8')
+  const headers = Object.assign({
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': String(body.length),
+    'Cache-Control': 'no-store',
+  }, extraHeaders || {})
   try {
-    res.writeHead(200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      'Content-Length': String(body.length),
-      'Cache-Control': 'no-store',
-      'X-C2A-Observability': 'statistics',
-    })
+    res.writeHead(status, headers)
     if (method === 'HEAD') res.end()
     else res.end(body)
   } catch {
     return false
   }
   return true
+}
+
+/* ------------------------------------------------------------------ */
+/* Management auth - the rule the endpoint behind us would apply        */
+/* ------------------------------------------------------------------ */
+
+/** Where upstream generates the secret on first use (same path shim/health.js reads). */
+function managementSecretFile(opts) {
+  if (opts && opts.secretFile) return opts.secretFile
+  const home = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
+  return path.join(home, '.management-secret')
+}
+
+function readManagementSecret(opts) {
+  const fromEnv = process.env.CHAT2API_MANAGEMENT_SECRET
+  if (fromEnv && String(fromEnv).trim()) return String(fromEnv).trim()
+  try {
+    const file = managementSecretFile(opts)
+    if (!fs.existsSync(file)) return ''
+    return String(fs.readFileSync(file, 'utf8')).trim()
+  } catch {
+    return ''
+  }
+}
+
+function bearerOf(req) {
+  const headers = (req && req.headers) || {}
+  const raw = headers.authorization || headers.Authorization || ''
+  const m = /^Bearer\s+(.+)$/i.exec(String(raw))
+  return m ? m[1].trim() : ''
+}
+
+/** Constant-time compare; falls back to === when lengths differ (timing is moot). */
+function sameSecret(presented, expected) {
+  const a = Buffer.from(String(presented))
+  const b = Buffer.from(String(expected))
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+/**
+ * May this request read management data? Returns { status: 200 } when yes,
+ * otherwise the status and the refusal to answer with.
+ *
+ * Upstream generates the secret on first use and, until it exists, leaves the
+ * management API open - that is how the first client gets to configure the
+ * instance. Answering stats has to behave the same way, or we would break a
+ * deployment that upstream itself would have served.
+ */
+function checkManagementAuth(req, opts) {
+  let expected = ''
+  try {
+    expected = readManagementSecret(opts)
+  } catch {
+    expected = ''
+  }
+  if (!expected) return { status: 200 }
+  const presented = bearerOf(req)
+  if (!presented) {
+    return { status: 401, code: 'missing_token', message: 'a Bearer management secret is required' }
+  }
+  if (!sameSecret(presented, expected)) {
+    return { status: 403, code: 'invalid_token', message: 'the management secret is not valid' }
+  }
+  return { status: 200 }
 }
 
 /**

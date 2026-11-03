@@ -68,6 +68,58 @@ function collect(root, name, seen, missing) {
   for (const d of deps) collect(root, d, seen, missing)
 }
 
+/**
+ * Delete files that are on disk but never loaded at run time: TypeScript type
+ * declarations, source maps, docs and test fixtures. These ship inside ordinary
+ * dependency folders - `electron` alone carries ~2.9 MB of .d.ts (electron.d.ts
+ * plus @types/node) that no `require()` can ever reach.
+ *
+ * Only extensions/extras that are unambiguously dead are removed; anything the
+ * loader might want (package.json, .js/.cjs/.mjs/.json/.wasm/.node) is kept.
+ */
+const PRUNE_DIRS = new Set([
+  'test', 'tests', '__tests__', 'doc', 'docs', 'example', 'examples',
+  '.github', 'benchmark', 'benchmarks',
+])
+const PRUNE_FILES = new Set(['.d.ts', '.d.mts', '.d.cts', '.map', 'CHANGELOG.md', 'HISTORY.md', 'README.md', 'tsconfig.json', '.npmignore', '.eslintrc', '.eslintrc.js', '.eslintrc.json', '.prettierrc', 'tslint.json'])
+const PRUNE_SUFFIX = ['.ts', '.tsx', '.map', '.md', '.markdown']
+
+/**
+ * TypeScript sources are dead for the .js entry points, but the .stub / .cjs
+ * pair sometimes keeps resolvable JS in a file named *.ts-free, so only strip
+ * .ts next to an existing sibling .js of the same base name - that is the one
+ * case where we know for certain the .ts is the source of a compiled JS.
+ */
+function pruneContent(root) {
+  let bytes = 0
+  let files = 0
+  const stack = [root]
+  while (stack.length) {
+    const dir = stack.pop()
+    let entries
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      const p = path.join(dir, e.name)
+      if (e.isDirectory()) {
+        if (PRUNE_DIRS.has(e.name)) { bytes += dirSize(p); try { fs.rmSync(p, { recursive: true, force: true }) } catch { /* ignore */ } continue }
+        stack.push(p)
+        continue
+      }
+      if (!e.isFile()) continue
+      let drop = PRUNE_FILES.has(e.name)
+      if (!drop) for (const sfx of PRUNE_SUFFIX) if (e.name.endsWith(sfx)) { drop = true; break }
+      if (drop) {
+        try {
+          bytes += fs.statSync(p).size
+          fs.rmSync(p, { force: true })
+          files++
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  return { bytes, files }
+}
+
 function main() {
   if (!exists(NM)) {
     console.error(`prune-deps: ${NM} not found`)
@@ -139,6 +191,9 @@ function main() {
   }
 
   console.log(`prune-deps: removed ${removed} entries, ~${(freedBytes / 1048576).toFixed(1)} MB`)
+
+  const content = pruneContent(NM)
+  console.log(`prune-deps: dropped ${content.files} type/doc files, ~${(content.bytes / 1048576).toFixed(1)} MB`)
 
   // Sanity check: the packages the bundle needs must still resolve.
   for (const name of REQUIRED) {

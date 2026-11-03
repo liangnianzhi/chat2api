@@ -56,6 +56,9 @@ start_container() {
   docker run -d --name "$CONTAINER" \
     -p "127.0.0.1:${PORT}:8082" \
     -v "$WORKDIR/data:/data" \
+    # 套件测的是「凭据模型本身」：把门 pin 成开，下面四十多条 401/403/415 断言才有意义。
+    # 发布默认是关的（内网免登录），那一条由末尾的「局域网默认」阶段单独验证。
+    -e "CHAT2API_REQUIRE_AUTH=${SMOKE_GATE:-1}" \
     "$IMAGE" >/dev/null
   mark start_container_done
 }
@@ -743,6 +746,29 @@ catch { process.exit(0) }
   else
     fail "建立待验证账号失败：$(clip "$CREATED")"
   fi
+fi
+
+info "局域网默认：发布出去的就是「不登录」"
+# 上面的 401/403 断言之所以成立，是因为 start_container 把门 pin 开了。
+# 这里按发布默认（不设 CHAT2API_REQUIRE_AUTH）再起一次，确认开箱即用。
+if SMOKE_GATE=0 start_container >/dev/null 2>&1 && wait_ready; then
+  pass "门关闭时容器仍然就绪（/health 200）"
+  CODE="$(code_of "${BASE}/")"
+  [ "$CODE" = 200 ] \
+    && pass "无凭据 GET / -> 200（内网默认，不再要登录）" \
+    || fail "无凭据 GET / -> HTTP $CODE（应为 200）"
+  CODE="$(code_of "${BASE}/v1/models")"
+  [ "$CODE" = 200 ] \
+    && pass "无凭据 GET /v1/models -> 200" \
+    || fail "无凭据 GET /v1/models -> HTTP $CODE（应为 200）"
+  # 跨站请求不是身份问题，是 CSRF：门关了也必须挡住。
+  CODE="$(code_of -X POST "${BASE}/__ipc" -H "$JSON" -H "Origin: http://evil.example" \
+    -d '{"channel":"proxy:getStatus","args":[]}')"
+  [ "$CODE" = 403 ] \
+    && pass "门关闭时跨站 Origin 仍被拒 -> 403" \
+    || fail "门关闭时跨站 Origin -> HTTP $CODE（应为 403）"
+else
+  fail "门关闭时容器 60 秒内没有就绪"
 fi
 
 if [ "$FAILED" = 0 ]; then

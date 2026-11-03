@@ -26,7 +26,7 @@ fail() {
   [ -n "$FAILURES" ] && FAILURES="$FAILURES"$'\n'
   FAILURES="${FAILURES}  - $*"
 }
-info() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+info() { printf '\n\033[1m== %s\033[0m\n' "$*"; note "== $*"; }
 
 cleanup() {
   if [ -z "$VERIFY_URL" ]; then
@@ -51,14 +51,24 @@ start_container() {
 }
 
 wait_ready() {
-  for _ in $(seq 1 90); do
+  for _ in $(seq 1 60); do
     if curl -fsS "${BASE}/health" >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
   return 1
 }
 
-in_container() { docker exec "$CONTAINER" sh -c "$1" 2>&1; }
+# 进度落到文件，而不是只靠 stdout：卡住被外面 kill 掉时，缓冲里的输出会一起消失。
+# CI 每一步都会把 $C2A_SMOKE_PROGRESS 的内容回显出来，所以这里是唯一可靠的墓碑。
+PROGRESS_FILE="${C2A_SMOKE_PROGRESS:-}"
+note() {
+  [ -n "$PROGRESS_FILE" ] && printf '%s\n' "$*" >> "$PROGRESS_FILE" 2>/dev/null
+  return 0
+}
+
+# docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
+# 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。
+in_container() { timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1 || echo "in_container: timeout/非零退出" >&2; }
 
 # --- access control -------------------------------------------------------
 # Nothing but /health and the login page answers without a credential, so every

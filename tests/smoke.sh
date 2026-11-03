@@ -81,6 +81,13 @@ note() {
 # 出事的地方，不需要再猜。
 mark() { note "MARK $*"; }
 
+# 心跳：如果墓碑停在某个 MARK 之后、却仍有 HEARTBEAT 持续出现，说明 shell 活着，
+# 卡住的是那条子命令；如果连心跳也停了，说明整个进程被挂死或被杀了。
+if [ -n "$PROGRESS_FILE" ]; then
+  ( while :; do sleep 30; note "HEARTBEAT"; done ) &
+  HEARTBEAT_PID=$!
+fi
+
 # docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
 # 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。
 # 这里要防的是「子进程把父 shell 的 stdout 攥住」：docker exec 的会话若挂住，
@@ -96,7 +103,9 @@ in_container() {
     *) mark "in_container: $(printf '%s' "$1" | cut -c1-40 | tr -cd '[:alnum:] :/._-')" ;;
   esac
   EXEC_OUT="$(mktemp)"
-  timeout 20 docker exec "$CONTAINER" sh -c "$1" </dev/null >"$EXEC_OUT" 2>&1
+  # -k 2：SIGTERM 不理就 2 秒后 SIGKILL。只用 timeout 时，docker 客户端卡在
+  # 不可中断等待里可能无视 SIGTERM，那样连"超时"都不会发生。
+  timeout -k 2 20 docker exec "$CONTAINER" sh -c "$1" </dev/null >"$EXEC_OUT" 2>&1
   ec=$?
   if [ "$ec" = 124 ]; then
     mark "in_container TIMEOUT"
@@ -125,9 +134,15 @@ load_secret() {
       SECRET="$(tr -d '\r\n' < "$SECRET_FILE")"
     fi
   else
-    # 容器里的 secret 文件属主是容器用户，docker exec 以 root 读得到；
-    # 读不到就跳过（此时凭据类断言会以 "缺少凭据" 的形式失败，而不是静默放过）。
-    SECRET="$(in_container "cat $SECRET_FILE" 2>/dev/null | tr -d '\r\n')"
+    # 容器把 $WORKDIR/data 挂到 /data，所以密钥在宿主机上就是一份普通文件。
+    # 先读它：不走 docker exec，这条路根本不会被 exec 会话挂住（#182/#183 就是
+    # 死在 exec 上，20 分钟一动不动）。读不到才回退到 exec。
+    HOST_SECRET="$WORKDIR/data/.chat2api/.management-secret"
+    if [ -r "$HOST_SECRET" ]; then
+      SECRET="$(tr -d '\r\n' < "$HOST_SECRET")"
+    else
+      SECRET="$(in_container "cat $SECRET_FILE" 2>/dev/null | tr -d '\r\n')"
+    fi
   fi
   [ -n "$SECRET" ] && AUTH=(-H "Authorization: Bearer $SECRET")
   [ -n "$SECRET" ]

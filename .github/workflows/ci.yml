@@ -242,7 +242,15 @@ jobs:
             docker inspect chat2api \
               --format '{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}} oom={{.State.OOMKilled}} startedAt={{.State.StartedAt}} finishedAt={{.State.FinishedAt}} image={{.Config.Image}} entrypoint={{.Config.Entrypoint}} cmd={{.Config.Cmd}}' 2>&1 || true
             echo "--- 镜像里的入口与权限:"
-            docker run --rm --entrypoint sh "${'
+            docker run --rm --entrypoint sh ${{ env.IMAGE_REF }} \
+              -c 'id; ls -l /app/shim/entrypoint.sh; head -1 /app/shim/entrypoint.sh; node -v' 2>&1 || true
+            echo "--- 前台跑 20 秒，把启动阶段的输出全部抓下来:"
+            timeout 20 docker run --rm -v "$PWD/data:/data" ${{ env.IMAGE_REF }} 2>&1 | tail -60 || true
+            echo '::endgroup::'
+            echo '::error title=compose::容器没有起来，细节见上面三段的注解/job summary'
+            exit 1
+          fi
+
           if [ "$up_ec" != 0 ]; then
             echo "::error title=compose::docker compose up exited $up_ec"
             exit 1

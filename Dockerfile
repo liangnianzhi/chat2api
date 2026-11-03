@@ -88,10 +88,25 @@ RUN set -eux; \
 # 组装一个干净的运行目录，供下阶段整体 COPY。
 COPY shim/electron-shim.js /build/stage/shim/electron-shim.js
 COPY shim/gateway.js /build/stage/shim/gateway.js
+# 结构化自检：webui/server.js 的 /health 从这里取报告（拿不到就退回极简版）
+COPY shim/health.js /build/stage/shim/health.js
 COPY shim/entrypoint.sh /build/stage/shim/entrypoint.sh
+# 账号健康自愈层（见 shim/selfheal/README 注释在 index.js 顶部）
+COPY shim/selfheal.js /build/stage/shim/selfheal.js
+COPY shim/selfheal/ /build/stage/shim/selfheal/
+# 请求日志可观测性：失败分类 + 上游响应摘要 + 统计分组（见 shim/observability/install.js）
+COPY shim/observability/ /build/stage/shim/observability/
 COPY webui/server.js /build/stage/webui/server.js
+# 访问控制（凭据 / 同源 / Content-Type / 限流 / 审计）
+COPY webui/auth.js /build/stage/webui/auth.js
 COPY webui/preload-bridge.js /build/stage/webui/preload-bridge.js
 COPY webui/login.html /build/stage/webui/login.html
+# 访问控制探针：在运行中的容器里可直接跑
+#   docker exec chat2api sh /app/tests/auth_probe.sh
+COPY tests/auth_probe.sh /build/stage/tests/auth_probe.sh
+# 可观测性探针：不用构建镜像也能在运行中的容器里验证安装结果
+#   docker exec chat2api sh /app/tests/observability_smoke.sh
+COPY tests/observability_smoke.sh /build/stage/tests/observability_smoke.sh
 
 RUN set -eux; \
     mkdir -p /build/stage/upstream; \
@@ -126,6 +141,20 @@ LABEL org.opencontainers.image.title="chat2api" \
 # tzdata 提供时区数据（默认时区见下方）。
 RUN apk add --no-cache curl tini tzdata su-exec
 
+# ---- 镜像瘦身的固定部分 ------------------------------------------------
+# node 官方镜像带着一整套构建/发布工具，headless 网关一个都用不上：
+#   /usr/local/lib/node_modules/npm     ~4.6 MB  （运行时只用 node，不用 npm）
+#   /usr/local/include/node             ~4.9 MB  （C++ 头文件）
+#   /opt/yarn-v1.22.22                  ~5.3 MB  （yarn 发行包）
+# 删掉这 ~15 MB，镜像才谈得上接近 README 的体积承诺。
+# 镜像里没有任何 C/C++ 扩展需要编译，删除头文件不影响运行。
+RUN set -eux; \
+    rm -rf /usr/local/lib/node_modules \
+           /usr/local/include/node \
+           /opt/yarn-v1.22.22 \
+           /root/.cache \
+           /var/cache/apk/*; \
+    ls -d /usr/local/lib/node_modules /opt/yarn* 2>/dev/null || echo "build tooling removed"
 # 默认时区 Asia/Shanghai。
 # TZ 与 /etc/localtime 都设置：有的程序读环境变量，有的读时区文件。
 ENV TZ=Asia/Shanghai
@@ -152,9 +181,10 @@ COPY --from=builder /build/stage/ /app/
 
 RUN set -eux; \
     chmod +x /app/shim/entrypoint.sh; \
-    node -e "const e=require('/app/node_modules/electron'); \
-             if(!e.__isShim){console.error('electron 未指向 shim');process.exit(1)}; \
-             console.log('electron -> shim 校验通过')"; \
+    # 只检查模块引擎定位到的文件内容，不 require()。
+    # require() 会把 electron-shim 真正执行一遍，而它会顺手加载上游 bundle、启动代理服务（实测在构建阶段挂住不返回）。
+    grep -q "require('/app/shim/electron-shim.js')" /app/node_modules/electron/index.js; \
+    grep -q '"main": *"index.js"' /app/node_modules/electron/package.json; \
     test -f /app/upstream/main/headless.js; \
     test -f /app/upstream/renderer/index.html; \
     test -f /app/upstream/preload/index.js; \
@@ -162,6 +192,15 @@ RUN set -eux; \
     test -f /app/webui/preload-bridge.js; \
     test -f /app/webui/login.html; \
     test -f /app/shim/gateway.js; \
+    test -f /app/shim/health.js; \
+    test -f /app/shim/selfheal.js; \
+    test -f /app/shim/selfheal/index.js; \
+    test -f /app/shim/selfheal/auth-errors.js; \
+    test -f /app/shim/observability/install.js; \
+    test -f /app/shim/observability/failure-classify.js; \
+    test -f /app/shim/observability/request-log.js; \
+    test -f /app/shim/observability/stats.js; \
+    test -f /app/shim/observability/catalog.js; \
     test -x /app/shim/entrypoint.sh; \
     chown -R node:node /app; \
     echo '运行时布局就绪'
@@ -188,8 +227,12 @@ VOLUME ["/data"]
 # 唯一对外端口（也是唯一的端口号）
 EXPOSE 8082
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" || exit 1
+# 健康检查读的是 /health 的结构化自检（免鉴权）：只有数据卷不可读写、
+# 或代理没有跑起来时才返回非 2xx —— 这两种才是重启能治好的问题。
+# 失败时把报告打到容器日志，省得只看一个 unhealthy。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${CHAT2API_PORT}/health" >/dev/null \
+        || { curl -sS "http://127.0.0.1:${CHAT2API_PORT}/health" | cut -c1-500; exit 1; }
 
 ENTRYPOINT ["/sbin/tini", "--", "/app/shim/entrypoint.sh"]
 CMD ["node", "/app/shim/gateway.js"]

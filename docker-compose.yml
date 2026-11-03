@@ -8,13 +8,30 @@
 #   3. 浏览器打开 http://<主机IP>:8082
 #
 # 不需要 .env，也不需要预先生成任何密钥：管理密钥会在首次启动时自动生成
-# 并存在 data/ 里，界面自己使用它，因此打开网页即可用。
+# 并存在 data/（.chat2api/.management-secret）里。浏览器打开网页即可用；
+# 脚本/SDK 调接口要带这个密钥：Authorization: Bearer <密钥>。
+# 细节见 README「访问控制：谁能进这个端口」。
 #
 # 界面和 OpenAI 接口在同一个端口（和原桌面版一致），没有第二个端口。
 #
 # 可调项（一般不用改）：
 #   TZ                        容器时区，镜像默认 Asia/Shanghai
 #   CHAT2API_API_KEY          给 /v1 客户端访问加密钥（默认不启用）
+#   CHAT2API_MANAGEMENT_SECRET 固定管理密钥（不设则首次启动自动生成，存在 data/）
+#   CHAT2API_REQUIRE_AUTH      false 关闭访问控制（默认 true，仅限离线单机排查用）
+#   CHAT2API_TRUST_PROXY       true 时信任 X-Forwarded-* （放在反向代理后面才需要）
+#   CHAT2API_TRUSTED_ORIGINS   额外的同源白名单，逗号分隔，如 https://nas.example:5001
+#
+# 健康检查与日志轮转
+# ------------------
+# healthcheck 探的是容器**内部**的 /health（127.0.0.1:8082），与宿主机发布端口
+# 无关：改端口（./deploy.sh port 8090）不需要动这里。
+# /health 返回 200 才算健康；数据卷不可写或代理没起来时它返回 503，容器变
+# unhealthy，`docker compose ps` 和群晖面板都能直接看出来。
+# start_period 给了 45s：冷启动要装载上游 bundle 并等代理捕获请求处理器。
+#
+# 日志用 json-file 驱动并轮转：群晖的默认日志会一直长下去，一天几万条请求足以
+# 把系统盘写满。max-size × max-file = 每个容器 30MB 上限，超出后自动滚动。
 services:
   chat2api:
     # 南京大学镜像站：拉取加速。官方 ghcr.io 仅用于 CI 推送。
@@ -23,7 +40,31 @@ services:
     restart: unless-stopped
     ports:
       - "8082:8082"   # 界面 + OpenAI 兼容 API 共用一个端口
+    # personal 是群晖上既有的外部网络（反向代理 / 其他容器走内部地址访问）。
+    # 网络不存在时 compose 会直接报错，故标 external；纯单机部署可以整段删掉。
+    networks:
+      - personal
     volumes:
       # 账号、配置、日志、凭证加密密钥都在这里。备份它就等于备份了全部状态。
       # 属主由容器启动时自动修正，不需要手工 chown。
       - ./data:/data
+    healthcheck:
+      # curl 已在镜像里（Dockerfile 装过），不引入新依赖。
+      # 只看退出码：/health 自检失败时返回 503，curl -f 因此非零。
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8082/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  personal:
+    # 网络不存在时 compose 直接报错（deploy.sh 的 preflight 会先查一次）。
+    # personal 在群晖上是既有的共享网络，别的容器也在用，不要删除重建。
+    external: true
+    name: personal

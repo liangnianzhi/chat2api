@@ -4,7 +4,7 @@
 容器里，但并非原样编译——外面加了一层适配（`shim/`、`webui/`）。这层适配依赖上游
 若干**内部结构**。上游改动这些地方时，适配层可能失效。
 
-本文记录：当前跟随哪个版本、依赖哪些结构、上游更新后怎么核对。
+本文记录：当前跟随哪个版本、依赖哪些结构、我们在它外面加了什么、上游更新后怎么核对。
 
 ---
 
@@ -51,6 +51,54 @@ docker compose exec chat2api cat /app/UPSTREAM_INFO
 
 ---
 
+## 本仓库在上游之上加了什么
+
+上游代码在这里是**只读**的：构建时从上游拉源码，编译完就再也没人改它。
+本仓库自己的代码全部在 `shim/`、`webui/`、`tests/` 里，通过下面这些
+**接缝**作用到上游——记住这张表，就知道上游升级时哪些地方可能咬人。
+
+### 接缝：改的是上游的运行时，不是上游的代码
+
+| 接缝 | 实现位置 | 怎么挂上去 | 上游升级时的风险 |
+|---|---|---|---|
+| `safeStorage` / `process.resourcesPath` / `ipcMain` / `Tray` 等 Electron API | `shim/electron-shim.js` | 预加载阶段替换 `require('electron')` 的导出 | 上游若改用新的 Electron API，这里会缺 |
+| 单端口 | `shim/electron-shim.js` 拦 `http.Server.prototype.listen` | 摘走上游注册的 request 监听器，发布为 `__httpHandler` | 上游若改用 `Koa` 之外的方式监听，捕获失效 |
+| 无头入口 | `shim/headless-entry.ts` | 通过 `shim/patch-vite-config.js` 向 Rollup 加一个入口 | 上游改 `electron.vite.config.ts` 的 input 结构 |
+| 依赖裁剪 | `shim/prune-deps.js` | 按上游 `externalizeDepsPlugin` 的 exclude 列表递归保留闭包，缺包即构建失败 | 上游改 exclude 列表 |
+| 所有 HTTP 入口 | `webui/server.js` | 在已捕获的处理器**前面**加一道闸和处理 | 上游若新增非 HTTP 的入口，闸管不到 |
+| 代理启动与请求链路 | `shim/selfheal/`、`shim/observability/` | 通过 `ipcMain` 与上游的登录/验证调用点挂钩，只观察、只改 `status` 一个字 | 上游若改账号验证的方式或错误文案，分类会落到 `unknown` |
+| 统计接口 | `shim/observability/` | 包住 `/v0/management/statistics` 的响应，**只加字段不减字段** | 上游若改响应结构，合并逻辑要跟着看 |
+
+### 行为补丁清单（与上游的语义差异）
+
+这几条是**故意**和上游不一样的，不是 bug：
+
+1. **匿名请求一律拒绝**（`webui/auth.js`）——上游把单端口的路径当本机进程间调用，默认不鉴权。
+2. **不再给匿名请求自动补管理密钥**——自动补密钥只对已用 Bearer 认证的调用者生效。
+3. **不实现「来自 127.0.0.1 / 内网就放行」**——容器里所有入站都表现为 bridge 地址，无法区分。
+4. **账号失败不立刻定罪**（`shim/selfheal/`）——401/403 先冷却再复核；风控/限流/5xx/网络
+   一律不动 `status`。上游是「失败即标记 error，之后不再尝试」。
+5. **`/health` 看的是「能不能用」而不只是「活着」**——数据卷不可读写或代理没起来才 503。
+6. **请求日志多三个字段**（`failureCategory` / `failureReason` / `providerResponse`），
+   统计接口多失败分布与 p50/p95；上游原有字段一个不删。
+7. **`/management` 是 `/v0/management` 的别名**（上游只认后者，且在中间件里硬编码）。
+
+### 守住这些接缝的东西
+
+| 防线 | 位置 | 盯什么 |
+|---|---|---|
+| 构建期 | `Dockerfile` / `shim/prune-deps.js` | 导出拿不到、依赖缺包 → **构建失败**，不会产出坏镜像 |
+| 启动期 | `shim/gateway.js` 的自检日志 | 没捕获到处理器、没有管理密钥、鉴权被关 → 启动日志里明说 |
+| 运行期 | `/health` 的 `checks` / `warnings` | 数据卷、代理状态、自愈装没装、上游版本是否被锁 |
+| 测试 | `tests/observability_integration.js`、`tests/auth_selftest.js`、`tests/*.test.js` | 接缝本身（不是接缝后面的业务） |
+| 容器内冒烟 | `tests/smoke.sh`、`tests/observability_smoke.sh` | 对**真实构建产物**验证上面每一条 |
+| 文档 | `tests/docs_claims.js`（由 `tests/lint.sh` 调） | README 里可验证的说法与实际代码是否还对得上 |
+
+**升级上游时的推荐顺序**：先跑 `./tests/lint.sh`（秒级）→ 再看上表「接缝」列
+有没有触及 → 构建镜像 → `./tests/smoke.sh` → 最后 `docker exec … observability_smoke.sh`。
+
+---
+
 ## 上游更新后怎么做
 
 ### 1. 看上游改了什么
@@ -72,6 +120,8 @@ https://github.com/wxs0625/Chat2API-WXS/compare/b306c19fcb9fae78a4acfa365f22167c
 | 账号上去就没了 | 5 | 立即停止发布，查 `safeStorage` 用法 |
 | DeepSeek/GLM 报签名错 | 10 | 更新 wasm 文件名 |
 | 界面端口显示不对 | 9 | 看 `proxyStatusManager` 的 setter |
+| 日志里 `failureCategory` 大量 `unknown` | 文本规则 | 上游改了报错文案；对照新文案补一条规则（见 `shim/observability/failure-classify.js`） |
+| `/health` 里 self-heal 报未安装 | 接缝失效 | 上游改了验证调用点，`shim/selfheal/` 挂不上去；先看 `shim/gateway.js` 的自检日志 |
 
 ### 3. 升级后更新基线
 

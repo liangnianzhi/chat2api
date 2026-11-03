@@ -176,34 +176,32 @@ else
 fi
 
 info 'Executable bit on entrypoints'
-# 仓库里记的是 100644，Windows 工作区一律显示 755 —— 谁也不该指望人记得 chmod。
-#   git update-index --chmod=+x deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh
-
-# 入口要从别处被 exec（deploy.sh 在 NAS 上、entrypoint.sh 在镜像里），所以
-# 必须能在 Linux 上直接执行。检查顺序有讲究：
-#   * 树里有 .git 时，以 git 记的 mode 为准。先看 [ -x ] 曾经害过人：
-#     Windows 工作区 core.fileMode=false、磁盘上一律 755，检查永远通过，
-#     而 Linux checkout 出来的正是 644（126/127 就是这么来的）。
-#   * 没有 .git（tarball、CI artifact）时，看磁盘上的可执行位。
-if [ -d .git ]; then
-  for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
-    [ -f "$f" ] || continue
-    mode="$(git ls-files -s -- "$f" | cut -d' ' -f1)"
+# 入口要从别处被 exec（entrypoint.sh 在镜像里、deploy.sh 在 NAS 上），所以
+# 它们在 git 里必须是 100755：Linux 上 checkout 出来就是 644，exec 直接
+# 126/127。没 .git 的树（tarball、CI artifact）没有记录可言，只能看磁盘。
+check_exec() {
+  f=$1
+  [ -f "$f" ] || return 0
+  if [ -d .git ]; then
+    # 以 git 记的 mode 为准。先看 [ -x ] 曾经害过人：Windows 工作区
+    # core.fileMode=false、磁盘上一律 755，检查永远通过，而 Linux 上
+    # checkout 出来的正是 644。
+    mode=$(git ls-files -s -- "$f" | cut -d' ' -f1)
     case "$mode" in
       100755) pass "executable (git mode 755): $f" ;;
-      100644) fail "not executable: $f (git mode 644 -- chmod +x and commit)" ;;
+      100644) fail "not executable: $f (git mode 644 -- git update-index --chmod=+x '$f')" ;;
       '')     fail "not tracked by git: $f" ;;
       *)      pass "executable bit not tracked: $f" ;;
     esac
-  done
-else
-  for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
-    [ -f "$f" ] || continue
-    if [ -x "$f" ]; then pass "executable: $f"; else
-      fail "not executable: $f (chmod +x)"
-    fi
-  done
-fi
+  elif [ -x "$f" ]; then
+    pass "executable (no git index): $f"
+  else
+    fail "not executable: $f (chmod +x)"
+  fi
+}
+for f in deploy.sh shim/entrypoint.sh tests/smoke.sh tests/lint.sh tests/auth_probe.sh; do
+  check_exec "$f"
+done
 info 'Documented claims that go stale'
 # tests/docs_claims.js turns the README's testable statements (script inventory,
 # tuning defaults, routes, tuning table) into assertions against the code, so

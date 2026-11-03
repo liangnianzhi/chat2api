@@ -103,22 +103,34 @@ while IFS= read -r f; do
   esac
   [ -f "$f" ] || continue
   sh_total=$((sh_total + 1))
-  # 两个解释器都查。tests/smoke.sh 声明 `#!/usr/bin/env bash` 且用了数组，
-  # 但它也是唯一在 CI 里真正被当作 bash 跑的脚本，所以 bash -n 才是它的关键；
-  # deploy.sh / shim/entrypoint.sh / tests/auth_probe.sh 声明 `#!/bin/sh`，
-  # 在镜像（debian）里跑在 dash 下，sh -n 是关键。两者都做，谁坏了都看得见。
+  # 两个解释器都查，但按 shebang 分流——不是无脑两个都跑。
+  # tests/smoke.sh 声明 `#!/usr/bin/env bash` 且用了数组（AUTH=()）和 <<< here-string，
+  # 在 dash 下必然语法报错；2026-11-03 之前这里对每个脚本无条件跑 sh -n，于是
+  # CI 上 Repo lint 只跑 1 秒就 exit 1，红的就是这一条（根因实测确认，与 .git、
+  # node 版本、exec bit 全都无关）。声明 bash 的脚本以 bash -n 为准。
+  # deploy.sh / shim/entrypoint.sh / tests/auth_probe.sh 声明 `#!/bin/sh`，在镜像（debian）
+  # 里跑在 dash 下，sh -n 才是它们的关键。
+  shebang=$(head -n 1 "$f" 2>/dev/null || true)
   if bash -n "$f" 2>"$ERRLOG"; then
     pass "syntax (bash): $f"
   else
     fail "syntax (bash): $f"
     sed 's/^/        /' "$ERRLOG" >&2
   fi
-  if sh -n "$f" 2>"$ERRLOG"; then
-    pass "syntax (sh): $f"
-  else
-    fail "syntax (sh): $f"
-    sed 's/^/        /' "$ERRLOG" >&2
-  fi
+  case "$shebang" in
+    *bash*)
+      # 声明 bash 的脚本不再拿 sh 判；bash -n 已经在上面把过关了。
+      pass "syntax (sh): $f -- skipped, script declares bash"
+      ;;
+    *)
+      if sh -n "$f" 2>"$ERRLOG"; then
+        pass "syntax (sh): $f"
+      else
+        fail "syntax (sh): $f"
+        sed 's/^/        /' "$ERRLOG" >&2
+      fi
+      ;;
+  esac
 done <<EOF
 $(listing)
 EOF

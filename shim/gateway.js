@@ -112,7 +112,16 @@ const upstreamExports = require(GATEWAY_ENTRY)
 function enableManagementApi() {
   try {
     const home = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
-    const mgr = globalThis.__chat2apiStore || (shim && shim.__storeManager)
+    // Reached through the bundle's own export graph, the same way the
+    // observability layer finds its manager: the shim exposes no store seam, and
+    // a manager read from anywhere else could be a different instance than the
+    // one the routes consult.
+    const graph = (typeof shim.__upstreamExports === 'function' ? shim.__upstreamExports() : null)
+      || upstreamExports || {}
+    const cands = [graph.storeManager, graph.store, graph.StoreManager,
+      globalThis.__chat2apiStore, shim.__storeManager]
+    const mgr = cands.find((c) => c && typeof c.getConfig === 'function'
+      && typeof c.updateConfig === 'function')
     if (!mgr || typeof mgr.getConfig !== 'function' || typeof mgr.updateConfig !== 'function') {
       console.warn('[supervisor] store manager not reachable; management API left at its configured value')
       return

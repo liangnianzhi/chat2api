@@ -125,9 +125,10 @@ EOF
 [ "$sh_total" -gt 0 ] || fail 'no shell scripts found -- listing is broken'
 
 info 'Node syntax'
-# 不要写 "if ! command -v node"：找不到命令时 command -v 返回非零，
-# "if !" 本身在 POSIX sh 里是没问题的，但这一行曾经在 CI 上让整段检查
-# 被跳过（缺少 node 时既不报错也不检查）。这里用正向判断，找不到就明确失败。
+# 注意：这里不要写成 "if ! command -v node; then fail ...; fi"。
+# command -v 找不到命令时返回非零，而 "if !" 判断的是它的返回值；这样写虽然
+# 能跑，但 2026-11-03 之前 CI 里就是这么写的，结果整段检查被静默跳过。
+# 正向判断 + else 里明确 fail，缺 node 时一定红。
 if command -v node >/dev/null 2>&1; then
   js_total=0
   while IFS= read -r f; do

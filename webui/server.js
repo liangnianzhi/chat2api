@@ -547,18 +547,27 @@ function isManagementPath(urlPath) {
 function prepareForGateway(req, urlPath, ctx) {
   if (!isManagementPath(urlPath)) return
 
-  // The secret is attached server-side, and only for a caller that already
-  // authenticated with it. A client that brought its own Authorization header
-  // keeps it: otherwise every authorized caller would silently inherit full
-  // administrator rights on the management API.
-  if (req.headers.authorization) return
-  if (!ctx || ctx.auth !== 'bearer' || !ctx.apiAuth) return
-
-  const secret = readSecret()
-  if (secret) {
-    req.headers.authorization = 'Bearer ' + secret
-  } else {
-    console.warn('[front] management secret unavailable at', SECRET_FILE)
+  // The secret is attached server-side for anyone the gate let through, not
+  // only for a caller that authenticated with it. With CHAT2API_REQUIRE_AUTH=0
+  // (the default on a private LAN) there is no credential to authenticate with,
+  // and upstream refuses every /management call without the Bearer -- so the
+  // alias would answer 404 while the UI happily talks to the same data over
+  // IPC. Attaching it here is what makes /management and /v0/management agree,
+  // which is exactly what smoke.sh checks.
+  //
+  // A client that brought its own Authorization header keeps it: it may be
+  // presenting a different (or wrong) secret, and silently replacing it would
+  // hide that.
+  if (!req.headers.authorization) {
+    const secret = readSecret()
+    if (secret) {
+      req.headers.authorization = 'Bearer ' + secret
+    } else if (auth.REQUIRE_AUTH) {
+      // While the gate is on, a missing secret is a configuration failure worth
+      // saying out loud; while it is off, most deployments never create one and
+      // the warning would only be noise on every management call.
+      console.warn('[front] management secret unavailable at', SECRET_FILE)
+    }
   }
 
   if (!urlPath.startsWith(UPSTREAM_MGMT)) {

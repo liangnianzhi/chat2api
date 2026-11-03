@@ -634,10 +634,14 @@ catch { process.exit(0) }
     && pass "启动时打印 UPSTREAM_INFO" || fail "启动日志里没有 UPSTREAM_INFO"
   grep -q '\[startup\] self-check done' <<<"$LOGS" \
     && pass "启动自检已执行" || fail "启动日志里没有 self-check done"
-  LOG_MAX="$(docker inspect -f '{{index .HostConfig.LogConfig.Options "max-size"}}' "$CONTAINER" 2>/dev/null || echo '')"
+  # 一句模板查询在 Options 为空时只会返回空串，等于什么都不说。先把整个
+  # LogConfig 抓下来：driver 是什么、options 有没有，失败时才分得清是「我们没
+  # 传 --log-opt」还是「这台机器的默认 driver 不吃这个参数」。
+  LOG_CFG="$(docker inspect -f '{{json .HostConfig.LogConfig}}' "$CONTAINER" 2>/dev/null || echo '')"
+  LOG_MAX="$(grep -o '"max-size":"[^"]*"' <<<"$LOG_CFG" | head -1 | cut -d'"' -f4)"
   [ -n "$LOG_MAX" ] \
     && pass "日志轮转已生效（max-size=${LOG_MAX}）" \
-    || fail "容器未配置日志轮转（json-file max-size）"
+    || fail "容器未配置日志轮转：LogConfig=${LOG_CFG:-无}"
 
   info "镜像体积预算"
   SIZE_BYTES="$(docker image inspect "$IMAGE" --format '{{.Size}}' 2>/dev/null || echo 0)"

@@ -357,13 +357,20 @@ jobs:
           echo "### smoke progress（心跳 $BEATS 次）"
           echo
           echo '```'
-          grep -v HEARTBEAT "$PF" | tail -40 || true
+          grep -v HEARTBEAT "$PF" | grep -v '^[0-9:]* FAIL ' | tail -30 || true
           echo '```'
           STEPS=$(grep -v HEARTBEAT "$PF" | tail -1 | tr -cd '[:alnum:] .:_-' | cut -c1-300)
           echo "::error title=smoke-stopped-at::${STEPS}"
           echo "::error title=smoke-heartbeats::${BEATS}"
-          # 真正的 trace：排除心跳后的最后 12 行，一行一条注解。
-          grep -v HEARTBEAT "$PF" | tail -12 | while IFS= read -r line; do
+          # 失败的断言本身：原样输出，不经过 tr —— 中文断言说明必须可读。
+          # 只转义 % 和回车，否则 GitHub 的 :: 协议会把这行截断。
+          grep '^[0-9:]* FAIL ' "$PF" | head -15 | while IFS= read -r line; do
+            msg=${line//'%'/'%25'}
+            msg=${msg//$'\r'/}
+            printf '::error title=smoke-fail::%s\n' "$msg"
+          done
+          # 再补最后 6 条非 FAIL 的 trace，用来看它死在哪个阶段。
+          grep -v HEARTBEAT "$PF" | grep -v '^[0-9:]* FAIL ' | tail -6 | while IFS= read -r line; do
             printf '::error title=smoke-trace::%s\n' "$(printf '%s' "$line" | tr ' ' '_' | tr -cd '[:alnum:] .:_-')"
           done
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。

@@ -334,20 +334,30 @@ jobs:
 
       # 这一步总是执行（哪怕上面被 timeout 杀掉）：把 smoke 留下的进度文件回显出来。
       # stdout 会随进程被杀一起丢掉，这个文件不会——它就是墓碑。
+      # 这一步总是执行（哪怕上面被 timeout 杀掉）：把 smoke 留下的进度文件回显出来。
+      # stdout 会随进程被杀一起丢掉，这个文件不会——它就是墓碑。
       - name: Show smoke progress
         if: always()
         run: |
           PF="$RUNNER_TEMP/smoke.progress"
-          if [ -s "$PF" ]; then
-            echo '### smoke progress (last phase reached)'
-            echo
-            echo '```'
-            tail -20 "$PF"
-            echo '```'
-            echo "::error title=smoke-last-phase::$(tail -3 "$PF" | tr '\n' '|' | tr -cd '[:print:] |' | cut -c1-500)"
-          else
+          if [ ! -s "$PF" ]; then
             echo 'smoke 没有写过进度文件（可能根本没启动）'
+            echo '::error title=smoke-last-phase::no progress file at all'
+            exit 0
           fi
+          echo '### smoke progress (last phase reached)'
+          echo
+          echo '```'
+          tail -30 "$PF"
+          echo '```'
+          # 文件里现在只有 ASCII（时间 + PHASE n / MARK xxx），所以这一行不会再把
+          # 内容吃掉：上一版用 tr -cd '[:print:]' 在 C locale 下把中文标题整段删了。
+          last="$(tail -1 "$PF" | tr -cd '[:alnum:] .:_-' | cut -c1-300)"
+          echo "::error title=smoke-stopped-at::${last}"
+          # 顺带把最后 8 行也贴进注解，省得为了看文件再跑一次。
+          for line in $(tail -8 "$PF" | tr ' ' '_' ); do
+            echo "::error title=smoke-trace::${line}"
+          done
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
       - name: Verify over HTTP like a real client
         run: |

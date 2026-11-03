@@ -53,7 +53,9 @@ const JSON_H = { 'Content-Type': 'application/json' }
 function bearer(extra) { return Object.assign({ Authorization: 'Bearer ' + SECRET }, extra || {}) }
 function ipcBody(channel, args) { return JSON.stringify({ channel: channel, args: args || [] }) }
 
-const PIN_GATE = ['--env', 'CHAT2API_REQUIRE_AUTH=1']
+// (--env takes ONE value, comma-separated: see the extras loop in local_harness.js;
+// a second --env would have been silently ignored and the gate left off.)
+const PIN_GATE = ['--env', 'CHAT2API_REQUIRE_AUTH=1,CHAT2API_AUTH_AUDIT=1']
 
 function startHarness(extraArgs) {
   const args = [HARNESS, '--port', String(PORT), '--secret', SECRET].concat(PIN_GATE)

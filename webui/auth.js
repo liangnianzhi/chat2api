@@ -1,6 +1,17 @@
 /**
  * Access control for the single public port.
  *
+ * ON BY DEFAULT?
+ * --------------
+ * No. CHAT2API_REQUIRE_AUTH defaults to 0: this image is meant for a private
+ * LAN (a NAS on the household network), where the door being open is the
+ * point - no login page between the operator and the UI, no token to copy
+ * into a client. The gate below still runs, and still does the two things
+ * that are not about identity - same-origin provenance and a JSON content
+ * type on state-changing requests - because those cost nothing and stop a
+ * stray web page from rewriting the config. For anything reachable beyond the
+ * LAN, set CHAT2API_REQUIRE_AUTH=1 and the whole model below applies.
+ *
  * WHY THIS FILE EXISTS
  * --------------------
  * Everything the container can do is reachable on port 8082: the IPC bridge
@@ -80,7 +91,9 @@ function envBool(name, def) {
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
 }
 
-const REQUIRE_AUTH = envBool('CHAT2API_REQUIRE_AUTH', true)
+// OFF by default: this deployment lives on a private LAN (CHAT2API_REQUIRE_AUTH=1
+// turns the gate back on for an instance that is reachable from elsewhere).
+const REQUIRE_AUTH = envBool('CHAT2API_REQUIRE_AUTH', false)
 const TRUST_PROXY = envBool('CHAT2API_TRUST_PROXY', false)
 const COOKIE_NAME = process.env.CHAT2API_COOKIE_NAME || 'c2a_session'
 const SESSION_TTL_MS = envInt('CHAT2API_SESSION_TTL_MINUTES', 720) * 60 * 1000

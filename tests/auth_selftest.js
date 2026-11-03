@@ -53,8 +53,12 @@ const JSON_H = { 'Content-Type': 'application/json' }
 function bearer(extra) { return Object.assign({ Authorization: 'Bearer ' + SECRET }, extra || {}) }
 function ipcBody(channel, args) { return JSON.stringify({ channel: channel, args: args || [] }) }
 
+const PIN_GATE = ['--env', 'CHAT2API_REQUIRE_AUTH=1']
+
 function startHarness(extraArgs) {
-  const args = [HARNESS, '--port', String(PORT), '--secret', SECRET].concat(extraArgs || [])
+  const args = [HARNESS, '--port', String(PORT), '--secret', SECRET].concat(PIN_GATE)
+    .concat(PIN_GATE)
+    .concat(extraArgs || [])
   // 'inherit' stdio: it must work under a confined shell (piped stdio is denied),
   // and the harness log is read straight off the terminal anyway.
   const child = spawn(process.execPath, args, { stdio: 'inherit' })
@@ -373,7 +377,7 @@ async function phaseAudit() {
   const probe = 'leaked-secret-value-xyz'
   const logPath = path.join(os.tmpdir(), 'c2a-audit-' + process.pid + '-' + Date.now() + '.log')
   const fd = fs.openSync(logPath, 'w')
-  const args = [HARNESS, '--port', String(PORT), '--secret', SECRET]
+  const args = [HARNESS, '--port', String(PORT), '--secret', SECRET].concat(PIN_GATE)
   // stdio is inherited (a confined shell denies pipes); fd 1/2 of the child are the
   // file, while our own test output keeps going to the terminal.
   const child = spawn(process.execPath, args, { stdio: ['ignore', fd, fd] })

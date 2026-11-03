@@ -182,6 +182,8 @@ jobs:
       # （匿名 403，读不到）和 job summary 里（只有 exit code）都看不见。
       # 现在：把 ps / 完整容器日志 / 健康检查结果全部打进 step summary，
       # 并把最后几行转成 ::error 注解，这样失败原因在 check-run 上就能读到。
+      - name: Bring the stack up via compose
+        run: |
           mkdir -p data
           # 诊断原则：每一条线索要么进 job summary，要么变成注解。job log 读不到（匿名 403），
           # 所以只在 echo 里出现的信息等于没记。

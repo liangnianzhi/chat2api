@@ -580,33 +580,6 @@ function checkManagementAuth(req, opts) {
 }
 
 /**
- * May this request read management data? Returns { status: 200 } when yes,
- * otherwise the status and the refusal to answer with.
- *
- * Upstream generates the secret on first use and, until it exists, leaves the
- * management API open - that is how the first client gets to configure the
- * instance. Answering stats has to behave the same way, or we would break a
- * deployment that upstream itself would have served.
- */
-function checkManagementAuth(req, opts) {
-  let expected = ''
-  try {
-    expected = readManagementSecret(opts)
-  } catch {
-    expected = ''
-  }
-  if (!expected) return { status: 200 }
-  const presented = bearerOf(req)
-  if (!presented) {
-    return { status: 401, code: 'missing_token', message: 'a Bearer management secret is required' }
-  }
-  if (!sameSecret(presented, expected)) {
-    return { status: 403, code: 'invalid_token', message: 'the management secret is not valid' }
-  }
-  return { status: 200 }
-}
-
-/**
  * Build the /statistics payload: upstream's own numbers (when we can reach
  * them) plus ours. Every upstream field keeps its name and meaning; we only
  * add keys.

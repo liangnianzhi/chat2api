@@ -53,13 +53,25 @@ BASE="http://127.0.0.1:${PORT}"
 start_container() {
   mark start_container
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # 套件测的是「凭据模型本身」：把门 pin 成开，下面四十多条 401/403/415 断言才有意义。
+  # 发布默认是关的（内网免登录），那一条由末尾的「局域网默认」阶段单独验证。
+  #
+  # 注释只能写在命令**前面**：\ 续行会把下一行接成同一行，那一行上的 # 会把
+  # 后面所有参数一起吞掉——上一次就是这么把 -p/-v/-e/镜像全吞了，docker run 连
+  # 容器都没建，墓碑只留下 'No such container'。
+  local rc=0
   docker run -d --name "$CONTAINER" \
     -p "127.0.0.1:${PORT}:8082" \
     -v "$WORKDIR/data:/data" \
-    # 套件测的是「凭据模型本身」：把门 pin 成开，下面四十多条 401/403/415 断言才有意义。
-    # 发布默认是关的（内网免登录），那一条由末尾的「局域网默认」阶段单独验证。
     -e "CHAT2API_REQUIRE_AUTH=${SMOKE_GATE:-1}" \
-    "$IMAGE" >/dev/null
+    "$IMAGE" >"$WORKDIR/run.log" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then
+    # docker run 自己失败时，stderr 才是原因，而且它不会进 job log（匿名看不到）。
+    note "docker run failed rc=$rc"
+    tr -d '\r' <"$WORKDIR/run.log" 2>/dev/null | while IFS= read -r ln; do
+      note "run: $ln"
+    done
+  fi
   mark start_container_done
 }
 

@@ -26,7 +26,12 @@ fail() {
   [ -n "$FAILURES" ] && FAILURES="$FAILURES"$'\n'
   FAILURES="${FAILURES}  - $*"
 }
-info() { printf '\n\033[1m== %s\033[0m\n' "$*"; note "== $*"; }
+PHASE_NO=0
+info() {
+  PHASE_NO=$((PHASE_NO + 1))
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  note "PHASE $PHASE_NO"
+}
 
 cleanup() {
   if [ -z "$VERIFY_URL" ]; then
@@ -61,10 +66,17 @@ wait_ready() {
 # 进度落到文件，而不是只靠 stdout：卡住被外面 kill 掉时，缓冲里的输出会一起消失。
 # CI 每一步都会把 $C2A_SMOKE_PROGRESS 的内容回显出来，所以这里是唯一可靠的墓碑。
 PROGRESS_FILE="${C2A_SMOKE_PROGRESS:-}"
+# 只要 ASCII：runner 的 C locale 下 `tr -cd '[:print:]'`（CI 里回显时用的）
+# 会把中文整段删掉，上一轮墓碑就只剩 "== |== |== |"，等于没写。
 note() {
-  [ -n "$PROGRESS_FILE" ] && printf '%s\n' "$*" >> "$PROGRESS_FILE" 2>/dev/null
+  [ -n "$PROGRESS_FILE" ] || return 0
+  printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >> "$PROGRESS_FILE" 2>/dev/null
   return 0
 }
+
+# 每个可能阻塞的动作都留一对 marks：开始/结束。卡住时，最后一条 marks 就是
+# 出事的地方，不需要再猜。
+mark() { note "MARK $*"; }
 
 # docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
 # 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。

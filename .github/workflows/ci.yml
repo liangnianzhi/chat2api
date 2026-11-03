@@ -63,8 +63,14 @@ jobs:
           OUT="$RUNNER_TEMP/lint.out"
           # 这里的 bash 只负责管上面那个管道；lint 自己必须由 sh(dash) 跑。
           set -o pipefail
-          sh tests/lint.sh 2>&1 | tee "$OUT"
-          ec=$?
+          sh tests/lint.sh 2>&1 | tee "$OUT" || true
+          ec="${PIPESTATUS[0]}"
+          # 拿不到 job log（匿名 403），所以把每条 FAIL/ERROR 转成 ::error 注解。
+          # 注解挂在本次 run 的 check-run 上，匿名可读：
+          #   GET /repos/{repo}/check-runs/{id}/annotations
+          grep -n -E 'FAIL|ERROR' "$OUT" | head -30 | while IFS= read -r r; do
+            echo "::error title=lint::${r//'%'/'%25'}"
+          done || true
           {
             echo '### Repo lint'
             echo

@@ -93,6 +93,69 @@ function captured() {
 const upstreamExports = require(GATEWAY_ENTRY)
 
 /* ------------------------------------------------------------------ */
+/* Management API - on by default for this image                       */
+/*                                                                     */
+/* The upstream default is `enableManagementApi: false`, which is right */
+/* for a desktop app that is driven by its window: the HTTP surface is  */
+/* an unnecessary door. This image has no window - /v0/management is    */
+/* the only way to reach accounts, providers and statistics from        */
+/* outside - so leaving it shut would make the container unusable while */
+/* looking healthy.                                                    */
+/*                                                                     */
+/* Two things are written, and only when they are missing: the enable   */
+/* flag (a store with the flag already set is left exactly as the        */
+/* operator left it) and the secret upstream refuses to answer without  */
+/* (it generates one on first use in the UI, which cannot happen here). */
+/* The secret is never logged: /data/.chat2api/.management-secret is the */
+/* only copy, readable by the container user.                           */
+/* ------------------------------------------------------------------ */
+function enableManagementApi() {
+  try {
+    const home = process.env.CHAT2API_HOME || path.join(process.env.HOME || '/data', '.chat2api')
+    const mgr = globalThis.__chat2apiStore || (shim && shim.__storeManager)
+    if (!mgr || typeof mgr.getConfig !== 'function' || typeof mgr.updateConfig !== 'function') {
+      console.warn('[supervisor] store manager not reachable; management API left at its configured value')
+      return
+    }
+    const current = mgr.getConfig() || {}
+    const mgmt = current.managementApi || {}
+    const updates = {}
+    if (mgmt.enableManagementApi !== true) updates.enableManagementApi = true
+    if (!mgmt.managementApiSecret) {
+      const fromEnv = String(process.env.CHAT2API_MANAGEMENT_SECRET || '').trim()
+      let secret = fromEnv
+      if (!secret) {
+        const file = path.join(home, '.management-secret')
+        try {
+          if (fs.existsSync(file)) secret = String(fs.readFileSync(file, 'utf8')).trim()
+        } catch { /* fall through to generating one */ }
+        if (!secret) {
+          secret = 'mgmt_' + require('crypto').randomUUID()
+          try {
+            fs.mkdirSync(home, { recursive: true })
+            fs.writeFileSync(file, secret, { mode: 0o600 })
+          } catch (err) {
+            console.error('[supervisor] cannot persist the management secret:', err && err.message)
+          }
+        }
+      }
+      updates.managementApiSecret = secret
+    }
+    if (!Object.keys(updates).length) {
+      console.log('[supervisor] management API already configured')
+      return
+    }
+    mgr.updateConfig({ managementApi: { ...mgmt, ...updates } })
+    console.log('[supervisor] management API enabled'
+      + (updates.managementApiSecret ? ' (secret generated; see $CHAT2API_HOME/.management-secret)' : ''))
+  } catch (err) {
+    // Never fatal: the UI works over IPC whether or not the HTTP surface does.
+    console.error('[supervisor] failed to enable the management API:', err && err.message)
+  }
+}
+enableManagementApi()
+
+/* ------------------------------------------------------------------ */
 /* Account self-heal - see shim/selfheal/                             */
 /*                                                                    */
 /* Installed after the bundle so the classes it patches exist, and    */

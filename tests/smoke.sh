@@ -81,6 +81,14 @@ note() {
 # 出事的地方，不需要再猜。
 mark() { note "MARK $*"; }
 
+# 任何一条 curl 都必须有上限：没有 --max-time 时，服务端一个挂住的 handler 就能
+# 把整套 smoke 拖到墙钟上限。包一层，比在六十个调用点上逐个补参数可靠。
+curl() { command curl --max-time 20 --connect-timeout 5 "$@"; }
+
+# 同理包住 docker：客户端卡在不可中断等待里时 timeout 也未必杀得掉，但至少每条
+# docker 命令都有上限，不会无声无息地占着整步。
+docker() { command timeout -k 5 60 docker "$@"; }
+
 # 心跳：如果墓碑停在某个 MARK 之后、却仍有 HEARTBEAT 持续出现，说明 shell 活着，
 # 卡住的是那条子命令；如果连心跳也停了，说明整个进程被挂死或被杀了。
 if [ -n "$PROGRESS_FILE" ]; then

@@ -49,6 +49,15 @@ jobs:
       # 在 CI 的全新 checkout 上 ./tests/lint.sh 会 "Permission denied"，
       # 而脚本自己的可执行位检查只看工作区（还会回退到 git index），看不见这件事。
       # 2026-11-03 的 main 构建（run 123）就是这样在 0 秒内失败的。
+      #
+      # 先探两件事，失败也留痕：日志本身我这边取不到（/logs 匿名 403），
+      # 只能靠 job summary。等日志可读了就把这两步删掉。
+      - name: Probe the lint environment
+        run: |
+          bash --version | head -1
+          cd "$GITHUB_WORKSPACE" && ls -l tests/lint.sh && head -1 tests/lint.sh | od -c | head -2
+          bash -n tests/lint.sh && echo 'bash -n tests/lint.sh: OK'
+
       - name: Repo lint
         run: bash tests/lint.sh
 

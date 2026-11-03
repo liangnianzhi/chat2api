@@ -84,8 +84,16 @@ mark() { note "MARK $*"; }
 # docker exec 会一直等会话结束：容器没起来时它不是报错，而是永久阻塞。
 # 之前整步 20 分钟被杀，就是死在这一句上，而且什么也没打印。
 in_container() {
-  mark "in_container: $(printf '%s' "$1" | cut -c1-40)" | tr -cd '[:alnum:] :/._-'
-  timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1
+  # 只记调用形状，不记内容：凭据类命令会把 secret 写进参数里。
+  case "$1" in
+    *management-secret*) mark "in_container: <secret-read>" ;;
+    *) mark "in_container: $(printf '%s' "$1" | cut -c1-40 | tr -cd '[:alnum:] :/._-')" ;;
+  esac
+  timeout 20 docker exec "$CONTAINER" sh -c "$1" 2>&1 || {
+    ec=$?
+    [ "$ec" = 124 ] && mark "in_container TIMEOUT"
+    return "$ec"
+  }
 }
 
 # --- access control -------------------------------------------------------

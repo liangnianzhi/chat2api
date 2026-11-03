@@ -171,9 +171,31 @@ jobs:
       # 性检查。它们只需要 node >= 18，先跑，失败时不用等到 compose 起容器。
       - name: Auth selftest and documentation claims
         run: |
-          node tests/auth_selftest.js
-          node tests/docs_claims.js
-
+          set +e
+          node tests/auth_selftest.js > /tmp/auth.log 2>&1
+          auth_ec=$?
+          node tests/docs_claims.js > /tmp/docs.log 2>&1
+          docs_ec=$?
+          cat /tmp/auth.log /tmp/docs.log
+          {
+            echo '### auth selftest / docs claims'
+            echo
+            echo "- auth_selftest exit: $auth_ec"
+            echo "- docs_claims exit: $docs_ec"
+            echo
+            echo '```'
+            tail -120 /tmp/auth.log
+            tail -40 /tmp/docs.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$auth_ec" != 0 ] || [ "$docs_ec" != 0 ]; then
+            # 断言名只出现在 stdout 里，而 job log 匿名读不到；转成注解才看得见。
+            grep -h -E 'FAIL|FAILED|crashed' /tmp/auth.log /tmp/docs.log 2>/dev/null \
+              | head -25 | while IFS= read -r r; do
+                  echo "::error title=assertion::${r//'%'/'%25'}"
+                done || true
+            exit 1
+          fi
       - name: Validate compose file
         run: docker compose config --quiet && echo 'compose config OK'
 

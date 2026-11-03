@@ -37,11 +37,15 @@ jobs:
           echo '--- 待提交的改动:'
           git diff --cached --summary
 
-          git commit -m 'chore: mark the entrypoints executable in git' \
-                     -m 'deploy.sh, shim/entrypoint.sh and the three test scripts were recorded as 100644. A Linux checkout therefore hands out 644 files: the image exec-s the entrypoint as 126/127, and ./deploy.sh does not run on the NAS. Not one byte of any file changes here -- only the mode bits.'
-
-          # trigger 是 workflow_dispatch 时 HEAD 指向 main；detached 也一并兜住。
-          git push origin 'HEAD:main'
+          # 第二次运行时 mode 已经对了：不提交、不推送，也不报错。
+          if git diff --cached --quiet; then
+            echo '没有改动可提交：mode 已经是 100755'
+          else
+            git commit -m 'chore: mark the entrypoints executable in git' \
+                       -m 'deploy.sh, shim/entrypoint.sh and the three test scripts were recorded as 100644. A Linux checkout therefore hands out 644 files: the image exec-s the entrypoint as 126/127, and ./deploy.sh does not run on the NAS. Not one byte of any file changes here -- only the mode bits.'
+            # trigger 是 workflow_dispatch 时 HEAD 指向 main；detached 也一并兜住。
+            git push origin 'HEAD:main'
+          fi
 
       # GITHUB_TOKEN 推的提交不会自动触发别的 workflow（防递归），
       # 但 workflow_dispatch 是官方明说的例外，所以这里直接把构建打起来，

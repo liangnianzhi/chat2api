@@ -121,7 +121,7 @@ EOF
 [ "$sh_total" -gt 0 ] || fail 'no shell scripts found -- listing is broken'
 
 info 'Node syntax'
-if ! command -v node >/dev/null 2>&1; then
+if ! command -v node; then
   fail 'node not found in PATH'
 else
   js_total=0

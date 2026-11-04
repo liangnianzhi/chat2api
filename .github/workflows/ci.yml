@@ -61,10 +61,15 @@ jobs:
       - name: Repo lint
         run: |
           OUT="$RUNNER_TEMP/lint.out"
-          # 这里的 bash 只负责管上面那个管道；lint 自己必须由 sh(dash) 跑。
-          set -o pipefail
-          sh tests/lint.sh 2>&1 | tee "$OUT" || true
-          ec="${PIPESTATUS[0]}"
+          # lint 自己必须由 sh(dash) 跑：bash 能解析的语法，dash 未必能，
+          # 而 CI 若用 bash 调它，那种语法就永远暴露不了。
+          #
+          # 不要写成 `... | tee "$OUT" || true`：`|| true` 会把 PIPESTATUS 重置成
+          # 它自己的状态，ec 永远是 0——lint 于是变成一条只打印、不拦构建的建议。
+          # 输出先落文件，再 cat 到 job log，两者都要，且 ec 取自 lint 本身。
+          sh tests/lint.sh > "$OUT" 2>&1
+          ec=$?
+          cat "$OUT"
           # 拿不到 job log（匿名 403），所以把每条 FAIL/ERROR 转成 ::error 注解。
           # 注解挂在本次 run 的 check-run 上，匿名可读：
           #   GET /repos/{repo}/check-runs/{id}/annotations
@@ -346,11 +351,17 @@ jobs:
       # （#184 的 8 条 trace 注解全是 HEARTBEAT，等于什么都没说）。
       - name: Show smoke progress
         if: always()
+        env:
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
         run: |
+          # 这一步在成功时也跑（if: always()），所以注解级别要跟着 smoke 的结果走：
+          # 绿的 run 上挂 8 条 error 只会让人以为出了事。
+          LEVEL=error
+          [ "$SMOKE_OUTCOME" = success ] && LEVEL=notice
           PF="$RUNNER_TEMP/smoke.progress"
           if [ ! -s "$PF" ]; then
             echo 'smoke 没有写过进度文件（可能根本没启动）'
-            echo '::error title=smoke-last-phase::no progress file at all'
+            echo "::$LEVEL title=smoke-last-phase::no progress file at all"
             exit 0
           fi
           BEATS=$(grep -c HEARTBEAT "$PF" 2>/dev/null || echo 0)
@@ -360,18 +371,18 @@ jobs:
           grep -v HEARTBEAT "$PF" | grep -v '^[0-9:]* FAIL ' | tail -30 || true
           echo '```'
           STEPS=$(grep -v HEARTBEAT "$PF" | tail -1 | tr -cd '[:alnum:] .:_-' | cut -c1-300)
-          echo "::error title=smoke-stopped-at::${STEPS}"
-          echo "::error title=smoke-heartbeats::${BEATS}"
+          echo "::$LEVEL title=smoke-stopped-at::${STEPS}"
+          echo "::$LEVEL title=smoke-heartbeats::${BEATS}"
           # 失败的断言本身：原样输出，不经过 tr —— 中文断言说明必须可读。
           # 只转义 % 和回车，否则 GitHub 的 :: 协议会把这行截断。
           grep '^[0-9:]* FAIL ' "$PF" | head -15 | while IFS= read -r line; do
             msg=${line//'%'/'%25'}
             msg=${msg//$'\r'/}
-            printf '::error title=smoke-fail::%s\n' "$msg"
+            printf '::%s title=smoke-fail::%s\n' "$LEVEL" "$msg"
           done
           # 再补最后 6 条非 FAIL 的 trace，用来看它死在哪个阶段。
           grep -v HEARTBEAT "$PF" | grep -v '^[0-9:]* FAIL ' | tail -6 | while IFS= read -r line; do
-            printf '::error title=smoke-trace::%s\n' "$(printf '%s' "$line" | tr ' ' '_' | tr -cd '[:alnum:] .:_-')"
+            printf '::%s title=smoke-trace::%s\n' "$LEVEL" "$(printf '%s' "$line" | tr ' ' '_' | tr -cd '[:alnum:] .:_-')"
           done
       # 再用「外部客户端」视角验证：只有 HTTP，不碰 docker。
       # 诊断规则和 smoke 步骤一样：job log 读不到（匿名 403），所以每条失败都必须

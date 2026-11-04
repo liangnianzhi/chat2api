@@ -67,8 +67,9 @@ jobs:
           # 不要写成 `... | tee "$OUT" || true`：`|| true` 会把 PIPESTATUS 重置成
           # 它自己的状态，ec 永远是 0——lint 于是变成一条只打印、不拦构建的建议。
           # 输出先落文件，再 cat 到 job log，两者都要，且 ec 取自 lint 本身。
-          sh tests/lint.sh > "$OUT" 2>&1
-          ec=$?
+          # `&& ... || ...` 而不是让 set -e 直接中断：lint 失败时下面的注解和
+          # job summary 才是唯一能看到的现场，不能被一次非零退出跳过。
+          sh tests/lint.sh > "$OUT" 2>&1 && ec=0 || ec=$?
           cat "$OUT"
           # 拿不到 job log（匿名 403），所以把每条 FAIL/ERROR 转成 ::error 注解。
           # 注解挂在本次 run 的 check-run 上，匿名可读：
